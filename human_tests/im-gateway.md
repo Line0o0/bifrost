@@ -1137,6 +1137,7 @@ BIFROST_DATA_DIR=./.bifrost-test cargo run --bin bifrost -- start -p 8800 --unsa
 - **清理步骤**:
   - 无需清理；测试使用临时目录。
 - **执行记录（2026-06-11）**: PASS — 本地 macOS 执行 `SKIP_FRONTEND_BUILD=1 cargo test -p bifrost-admin schedule_external_runner_executes_from_configured_work_dir --lib -- --nocapture` 通过，验证 marker-file 工作目录断言不依赖平台路径格式；执行 `SKIP_FRONTEND_BUILD=1 cargo test -p bifrost-admin im_gateway::task_executor::tests::test_execute_script_text --lib -- --nocapture`，2 个脚本文本用例通过。Windows `.cmd` quoting 和 `exit 42` 路径由当前分支 Windows CI 继续补验。
+- **执行记录（2026-07-10）**: PASS — PR 361 run `29011785882` 的 `Windows Unit Tests (x86_64)` 暴露 `schedule_agent_adapter_config_overrides_runner_without_dropping_command` 在 Windows CI 中 10s 超时，日志为 `timeout after 10000ms`、`stdout=None`、`final_response=None`。修复后 Windows fake external runner override command 与其它外部 runner fixture 对齐：先 `more >nul` 消费 stdin，再输出标准 `assistant_final` JSONL，避免 Windows shell 纯文本 fixture 在 schedule external runner 收敛路径中偶发卡住。本地执行 `SKIP_FRONTEND_BUILD=1 cargo test -p bifrost-admin schedule_agent_adapter_config_overrides_runner_without_dropping_command --lib -- --nocapture` 通过；Windows 专属补验由后续 PR CI run 继续兜底。
 
 ### TC-IMG-69: CLI Feishu 只传 Provider ID 后交互式授权并自动完成配置
 
