@@ -10,8 +10,6 @@ use tracing::debug;
 
 use crate::cors::apply_cors_headers;
 use crate::handlers::{
-    agent_chat::handle_agent_chat,
-    agent_memories::handle_agent_memories,
     app_icon::handle_app_icon,
     asr::handle_asr,
     audit::handle_audit,
@@ -23,6 +21,7 @@ use crate::handlers::{
     config::handle_config,
     cors_preflight,
     devtools::handle_devtools,
+    diagnostics::handle_diagnostics,
     env::handle_env,
     error_response, frames,
     group::handle_group,
@@ -256,11 +255,7 @@ impl AdminRouter {
             return handle_audit(req, path).await;
         }
 
-        if path.starts_with("/api/agent/chat") {
-            handle_agent_chat(req, state, path).await
-        } else if path.starts_with("/api/agent/memories") {
-            handle_agent_memories(req, path).await
-        } else if path.starts_with("/api/asr") {
+        if path.starts_with("/api/asr") {
             handle_asr(req, path).await
         } else if path.starts_with("/api/speech") {
             handle_speech(req, path).await
@@ -278,6 +273,8 @@ impl AdminRouter {
             handle_traffic(req, state, push_manager.clone(), path).await
         } else if path.starts_with("/api/metrics") {
             handle_metrics(req, state, path).await
+        } else if path.starts_with("/api/diagnostics") {
+            handle_diagnostics(req, state, path).await
         } else if path.starts_with("/api/mobile-devices") {
             handle_mobile_devices(req, state, path, peer_addr).await
         } else if path.starts_with("/api/trust-probe") {

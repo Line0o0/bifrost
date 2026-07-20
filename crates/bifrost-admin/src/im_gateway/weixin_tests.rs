@@ -51,6 +51,55 @@ fn normalize_login_account_uses_ilink_fields_and_redirected_base_url() {
     assert_eq!(account.bot_token, "token-1");
 }
 
+#[tokio::test]
+async fn complete_login_uses_the_long_login_http_timeout() {
+    use bytes::Bytes;
+    use http_body_util::Full;
+    use hyper::body::Incoming;
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper::{Request, Response};
+    use hyper_util::rt::TokioIo;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind delayed login server");
+    let port = listener.local_addr().expect("mock local addr").port();
+    tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let io = TokioIo::new(stream);
+        let service = service_fn(|_req: Request<Incoming>| async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok::<_, hyper::Error>(
+                Response::builder()
+                    .status(200)
+                    .body(Full::new(Bytes::from_static(
+                        br#"{"status":"confirmed","bot_token":"token-1","ilink_bot_id":"bot-1@im.bot","ilink_user_id":"user-1@im.wechat"}"#,
+                    )))
+                    .unwrap(),
+            )
+        });
+        let _ = http1::Builder::new().serve_connection(io, service).await;
+    });
+
+    let provider =
+        WeixinProvider::with_http_timeouts(Duration::from_millis(50), Duration::from_millis(250));
+    let account = provider
+        .complete_login(
+            "poll-key",
+            Some(&format!("http://127.0.0.1:{port}")),
+            1,
+            Duration::ZERO,
+        )
+        .await
+        .expect("login status request must outlive the default request timeout");
+
+    assert_eq!(account.account_id, "bot-1@im.bot");
+    assert_eq!(account.user_id, "user-1@im.wechat");
+}
+
 #[test]
 fn normalize_update_converts_weixin_message_to_im_event() {
     let provider = test_provider();
@@ -102,6 +151,49 @@ fn normalize_update_extracts_ilink_item_list_text_and_numeric_message_id() {
     assert_eq!(
         event.message.as_ref().unwrap().raw_type.as_deref(),
         Some("1")
+    );
+}
+
+#[test]
+fn normalize_update_extracts_weixin_reply_reference() {
+    let provider = test_provider();
+    let event = WeixinProvider::normalize_update(
+        &provider,
+        "mock-bot@im.bot",
+        serde_json::json!({
+            "message_id": 7481921678546968584u64,
+            "from_user_id": "user-reply@im.wechat",
+            "message_type": 1,
+            "item_list": [
+                {
+                    "type": 1,
+                    "text_item": {
+                        "text": "这个链接对应哪篇文章？"
+                    },
+                    "ref_msg": {
+                        "message_item": {
+                            "type": 1,
+                            "msg_id": 7481920452618855176u64,
+                            "create_time_ms": 1783828843000u64,
+                            "text_item": {
+                                "text": "原回复 https://example.com/article"
+                            }
+                        }
+                    }
+                }
+            ]
+        }),
+    );
+
+    let message = event.message.expect("normalized message");
+    assert_eq!(message.text, "这个链接对应哪篇文章？");
+    assert_eq!(
+        message.reply_to,
+        Some(ImMessageReference {
+            message_id: Some("7481920452618855176".to_string()),
+            created_at_ms: Some(1783828843000),
+            text: Some("原回复 https://example.com/article".to_string()),
+        })
     );
 }
 

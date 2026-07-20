@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ClipboardEvent, type CSSProperties, type KeyboardEvent } from "react";
 import { useSearchParams } from "react-router-dom";
 import { Button, Card, Empty, Grid, Input, Modal, Segmented, Select, Space, Tag, Typography, message as antdMessage, theme } from "antd";
-import { BulbOutlined, DeleteOutlined, DownOutlined, FolderOpenOutlined, BorderOutlined, LeftOutlined, RobotOutlined, SendOutlined, SettingOutlined } from "@ant-design/icons";
+import { DeleteOutlined, DownOutlined, FolderOpenOutlined, BorderOutlined, LeftOutlined, RobotOutlined, SendOutlined, SettingOutlined } from "@ant-design/icons";
 import { apiFetch } from "../../api/apiFetch";
 import { buildApiUrl } from "../../runtime";
 import { getClientId } from "../../services/clientId";
@@ -38,9 +38,9 @@ import {
   type SessionDetail,
 } from "./AgentChatSection.helpers";
 import {
+  appendProcessStepToTimeline,
   historyEventsToMessages,
   historyEventsToTelemetry,
-  mergeDetailMessagesWithTimeline,
 } from "./AgentChatSection.timeline";
 import {
   isRunStateActive,
@@ -71,9 +71,7 @@ import { buildRunnerOptions, selectDefaultRunner } from "./aiLayout";
 const { Text } = Typography;
 const { TextArea } = Input;
 const { useBreakpoint } = Grid;
-const HISTORY_EVENT_PAGE_SIZE = 300;
 const THREAD_RAIL_COLLAPSED_STORAGE_KEY = "bifrost.agentChat.threadRailCollapsed";
-type AgentCollaborationMode = "plan";
 
 type AgentSessionEventPayload = {
   eventType?: string;
@@ -115,24 +113,6 @@ type AgentChatSectionProps = {
   onControlsReady?: (handle: AgentChatSectionHandle) => void;
 };
 
-function parseAgentPlanSlash(content: string): {
-  message: string;
-  collaborationMode?: AgentCollaborationMode;
-} {
-  const trimmed = content.trimStart();
-  if (!trimmed.startsWith("/plan")) {
-    return { message: content };
-  }
-  const rest = trimmed.slice("/plan".length);
-  if (rest.length > 0 && !/\s/.test(rest[0])) {
-    return { message: content };
-  }
-  return {
-    message: rest.trimStart(),
-    collaborationMode: "plan",
-  };
-}
-
 function explicitRunnerIdentity(
   status: RunTelemetry["status"] | undefined,
   thread: AgentThreadSummary | undefined,
@@ -150,33 +130,6 @@ function explicitRunnerIdentity(
     .filter((value): value is string => Boolean(value))
     .join(" ")
     .toLowerCase();
-}
-
-function supportsBuiltInAgentCommands({
-  runnerId,
-  runnerOptions,
-  selectedThread,
-  status,
-}: {
-  runnerId: string;
-  runnerOptions: RunnerOption[];
-  selectedThread?: AgentThreadSummary;
-  status?: RunTelemetry["status"];
-}) {
-  const explicit = explicitRunnerIdentity(status, selectedThread);
-  if (/\b(codex|chatgpt|webgpt|external|external_runner|chatgpt_web)\b/.test(explicit)) {
-    return false;
-  }
-  if (/\b(bifrost_agent|builtin)\b/.test(explicit)) {
-    return true;
-  }
-  if (selectedThread?.runner_id && selectedThread.runner_id !== "bifrost_agent") {
-    return false;
-  }
-  if (status?.runner_id && status.runner_id !== "bifrost_agent") {
-    return false;
-  }
-  return runnerId === "bifrost_agent" || selectedRunnerAdapter(runnerOptions, runnerId) === "bifrost_agent";
 }
 
 export function supportsRunningGuide({
@@ -275,18 +228,9 @@ type HistoryPagePayload = {
 
 function historyPageUrl(
   historyPath: string,
-  params: { tail?: boolean; limit?: number; cursor?: number; since?: number } = {},
+  params: { since?: number } = {},
 ) {
   const query = new URLSearchParams();
-  if (params.tail) {
-    query.set("tail", "true");
-  }
-  if (params.limit !== undefined) {
-    query.set("limit", String(params.limit));
-  }
-  if (params.cursor !== undefined) {
-    query.set("cursor", String(params.cursor));
-  }
   if (params.since !== undefined) {
     query.set("since", String(params.since));
   }
@@ -298,7 +242,7 @@ function historyPageUrl(
 
 async function fetchHistoryPage(
   historyPath: string,
-  params: { tail?: boolean; limit?: number; cursor?: number; since?: number } = {},
+  params: { since?: number } = {},
 ) {
   const response = await apiFetch(historyPageUrl(historyPath, params));
   if (!response.ok) {
@@ -325,8 +269,6 @@ export default function AgentChatSection({
   const [sessionKey, setSessionKey] = useState(() => `admin-chat-${Date.now()}`);
   const [historyPath, setHistoryPath] = useState<string | undefined>();
   const [historyLoading, setHistoryLoading] = useState(false);
-  const [historyLoadingOlder, setHistoryLoadingOlder] = useState(false);
-  const [historyHasOlder, setHistoryHasOlder] = useState(false);
   const [running, setRunning] = useState(false);
   const [supplementSubmitting, setSupplementSubmitting] = useState(false);
   const [runningInputMode, setRunningInputMode] = useState<"guide" | "queue">("guide");
@@ -344,14 +286,12 @@ export default function AgentChatSection({
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [newChatOpen, setNewChatOpen] = useState(false);
   const [newChatWorkDir, setNewChatWorkDir] = useState("");
-  const [newChatRunnerId, setNewChatRunnerId] = useState("bifrost_agent");
-  const [runnerId, setRunnerId] = useState("bifrost_agent");
-  const [defaultRunnerId, setDefaultRunnerId] = useState("bifrost_agent");
+  const [newChatRunnerId, setNewChatRunnerId] = useState("Codex");
+  const [runnerId, setRunnerId] = useState("Codex");
+  const [defaultRunnerId, setDefaultRunnerId] = useState("Codex");
   const [runnerOptions, setRunnerOptions] = useState<RunnerOption[]>([
-    { label: "Bifrost Agent", value: "bifrost_agent", adapter: "bifrost_agent" },
+    { label: "Codex Runner", value: "Codex", adapter: "codex" },
   ]);
-  const [composerMode, setComposerMode] = useState<AgentCollaborationMode | undefined>();
-  const [activeCollaborationMode, setActiveCollaborationMode] = useState<AgentCollaborationMode | undefined>();
   const [slashActiveIndex, setSlashActiveIndex] = useState(0);
   const slashActiveIndexRef = useRef(0);
   const [defaultWorkDir, setDefaultWorkDir] = useState("");
@@ -369,11 +309,6 @@ export default function AgentChatSection({
   const historyEventsRef = useRef<HistoryEvent[]>([]);
   const historyEventStartIndexRef = useRef<number | undefined>(undefined);
   const historyEventEndIndexRef = useRef<number | undefined>(undefined);
-  const historyOlderCursorRef = useRef<number | undefined>(undefined);
-  const historyLoadingOlderRef = useRef(false);
-  const activeDetailMessagesRef = useRef<ChatMessage[]>([]);
-  const activeTimelineHasOlderRef = useRef(false);
-  const loadOlderHistoryPageRef = useRef<() => void>(() => {});
   const initialThreadAutoSelectRef = useRef(false);
   const streamAbortRef = useRef<AbortController | null>(null);
 
@@ -452,10 +387,6 @@ export default function AgentChatSection({
 
   const handleMessagesScroll = useCallback(() => {
     updateMessagesScrollState();
-    const element = messagesScrollRef.current;
-    if (element && element.scrollTop < 96) {
-      loadOlderHistoryPageRef.current();
-    }
   }, [updateMessagesScrollState]);
 
   useEffect(() => {
@@ -491,23 +422,10 @@ export default function AgentChatSection({
     });
   }, []);
 
-  const visibleActiveMessagesFromTimeline = useCallback((timelineMessages: ChatMessage[]) => {
-    const detailMessages = activeDetailMessagesRef.current;
-    if (detailMessages.length === 0) {
-      return { messages: timelineMessages, hasOlder: false };
-    }
-    const merged = mergeDetailMessagesWithTimeline(detailMessages, timelineMessages);
-    return { messages: merged, hasOlder: false };
-  }, []);
-
   const resetHistoryEventWindow = useCallback(() => {
     historyEventsRef.current = [];
     historyEventStartIndexRef.current = undefined;
     historyEventEndIndexRef.current = undefined;
-    historyOlderCursorRef.current = undefined;
-    activeDetailMessagesRef.current = [];
-    activeTimelineHasOlderRef.current = false;
-    setHistoryHasOlder(false);
   }, []);
 
   const applyHistoryEventWindow = useCallback(
@@ -521,11 +439,6 @@ export default function AgentChatSection({
       historyEventStartIndexRef.current = page.start_index ?? 0;
       historyEventEndIndexRef.current =
         page.end_index ?? (page.start_index ?? 0) + events.length;
-      historyOlderCursorRef.current =
-        typeof page.next_cursor === "number"
-          ? page.next_cursor
-          : historyEventStartIndexRef.current;
-      activeTimelineHasOlderRef.current = Boolean(page.has_more);
       const nextTelemetry = historyEventsToTelemetry(
         events,
         matchedThread,
@@ -543,14 +456,12 @@ export default function AgentChatSection({
           timelineRunning || (!terminalTimeline && isThreadActive(matchedThread)),
         runningState: matchedThread?.run_state || matchedThread?.state,
       });
-      const visible = visibleActiveMessagesFromTimeline(restored);
-      setHistoryHasOlder(activeTimelineHasOlderRef.current);
-      replaceLoadedMessages(visible.messages, shouldStickToBottom);
+      replaceLoadedMessages(restored, shouldStickToBottom);
       setTelemetry(nextTelemetry);
       setRunning(timelineRunning || (!terminalTimeline && isThreadActive(matchedThread)));
-      return { restored: visible.messages, nextTelemetry };
+      return { restored, nextTelemetry };
     },
-    [replaceLoadedMessages, visibleActiveMessagesFromTimeline],
+    [replaceLoadedMessages],
   );
 
   const querySessionKey = searchParams.get("session") || undefined;
@@ -577,70 +488,6 @@ export default function AgentChatSection({
   useEffect(() => {
     telemetryPhaseRef.current = telemetry.phase;
   }, [telemetry.phase]);
-
-  const loadOlderHistoryPage = useCallback(async () => {
-    const timelineHistoryPath = historyPath || selectedThread?.history_path;
-    const cursor = historyOlderCursorRef.current;
-    if (
-      !timelineHistoryPath ||
-      cursor === undefined ||
-      cursor <= 0 ||
-      historyLoadingOlderRef.current ||
-      historyLoadingOlder ||
-      !historyHasOlder
-    ) {
-      return;
-    }
-    const element = messagesScrollRef.current;
-    const previousScrollHeight = element?.scrollHeight ?? 0;
-    const previousScrollTop = element?.scrollTop ?? 0;
-    const previousEndIndex = historyEventEndIndexRef.current;
-    historyLoadingOlderRef.current = true;
-    setHistoryLoadingOlder(true);
-    try {
-      const page = await fetchHistoryPage(timelineHistoryPath, {
-        cursor,
-        limit: HISTORY_EVENT_PAGE_SIZE,
-      });
-      const olderEvents = page.events || [];
-      if (olderEvents.length === 0) {
-        setHistoryHasOlder(false);
-        historyOlderCursorRef.current = undefined;
-        return;
-      }
-      const mergedEvents = [...olderEvents, ...historyEventsRef.current];
-      applyHistoryEventWindow(mergedEvents, page, selectedThread, false);
-      historyEventEndIndexRef.current =
-        previousEndIndex ?? historyEventEndIndexRef.current ?? mergedEvents.length;
-      requestAnimationFrame(() => {
-        const nextElement = messagesScrollRef.current;
-        if (!nextElement) {
-          return;
-        }
-        const addedHeight = nextElement.scrollHeight - previousScrollHeight;
-        nextElement.scrollTop = previousScrollTop + addedHeight;
-      });
-    } catch (error) {
-      antdMessage.error(
-        error instanceof Error ? error.message : "Failed to load older Agent history",
-      );
-    } finally {
-      historyLoadingOlderRef.current = false;
-      setHistoryLoadingOlder(false);
-    }
-  }, [
-    applyHistoryEventWindow,
-    historyHasOlder,
-    historyLoadingOlder,
-    historyPath,
-    selectedThread,
-  ]);
-
-  useEffect(() => {
-    loadOlderHistoryPageRef.current = () => {
-      void loadOlderHistoryPage();
-    };
-  }, [loadOlderHistoryPage]);
 
   const conversationTitle =
     telemetry.title ||
@@ -678,8 +525,8 @@ export default function AgentChatSection({
         source: telemetry.status?.source,
         runner_type:
           telemetry.status?.runner_type ||
-          (runnerId === "bifrost_agent" ? "bifrost_agent" : selectedRunnerAdapter(runnerOptions, runnerId)),
-        runner_id: telemetry.status?.runner_id || (runnerId === "bifrost_agent" ? undefined : runnerId),
+          selectedRunnerAdapter(runnerOptions, runnerId),
+        runner_id: telemetry.status?.runner_id || runnerId,
         agent_type: telemetry.status?.agent_type,
       });
   const currentRunnerTag = formatRunnerTag(telemetry.status, selectedThread, runnerId);
@@ -691,13 +538,6 @@ export default function AgentChatSection({
     thread: selectedThread,
   });
   const currentStateTag = formatCurrentStateTag(telemetry, selectedThread, displayRunning);
-  const showLoadOlder = historyHasOlder;
-  const builtInAgentCommandsSupported = supportsBuiltInAgentCommands({
-    runnerId,
-    runnerOptions,
-    selectedThread,
-    status: telemetry.status,
-  });
   const currentRunnerAdapter = selectedRunnerAdapter(runnerOptions, runnerId);
   const modelCommandsSupported = supportsRunnerModelSlashCommand(currentRunnerAdapter);
   const guideSupported = supportsRunningGuide({
@@ -713,21 +553,12 @@ export default function AgentChatSection({
     slashRunnerOptions,
     showSlashRunnerPanel,
   } = useSlashRunnerSelection({
-    enableCommands: builtInAgentCommandsSupported,
     enableModelCommands: modelCommandsSupported,
     draft,
     running,
     supplementSubmitting,
     runnerOptions,
   });
-
-  useEffect(() => {
-    if (builtInAgentCommandsSupported) {
-      return;
-    }
-    setComposerMode(undefined);
-    setActiveCollaborationMode(undefined);
-  }, [builtInAgentCommandsSupported]);
 
   const refreshThreads = useCallback(async () => {
     try {
@@ -871,15 +702,11 @@ export default function AgentChatSection({
         const defaultRunner = selectDefaultRunner(options).value;
         setRunnerOptions(options);
         setDefaultRunnerId(defaultRunner);
-        setRunnerId((current) =>
-          current === "bifrost_agent" ? defaultRunner : current,
-        );
-        setNewChatRunnerId((current) =>
-          current === "bifrost_agent" ? defaultRunner : current,
-        );
+        setRunnerId((current) => options.some((option) => option.value === current) ? current : defaultRunner);
+        setNewChatRunnerId((current) => options.some((option) => option.value === current) ? current : defaultRunner);
       })
       .catch(() => {
-        // Keep runner selection usable with the built-in runner fallback.
+        // Keep the last known external runner selection when configuration refresh fails.
       });
     return () => {
       cancelled = true;
@@ -980,7 +807,6 @@ export default function AgentChatSection({
             return;
           }
           const restored = sessionDetailToMessages(detail);
-          activeDetailMessagesRef.current = restored;
           const timelineHistoryPath =
             detail.history_path ||
             matchedThread?.history_path ||
@@ -1012,11 +838,6 @@ export default function AgentChatSection({
               historyEventEndIndexRef.current =
                 payload.end_index ??
                 (payload.start_index ?? 0) + timelineEvents.length;
-              historyOlderCursorRef.current =
-                typeof payload.next_cursor === "number"
-                  ? payload.next_cursor
-                  : historyEventStartIndexRef.current;
-              activeTimelineHasOlderRef.current = Boolean(payload.has_more);
               const timelineRunning = resolveRunningState({
                 fallbackRunning: detail.running === true,
                 state:
@@ -1038,12 +859,10 @@ export default function AgentChatSection({
               // Keep the active detail fallback usable while timeline is being written.
             }
           }
-          const loadedWindow =
+          const loadedMessages =
             timelineMessages && timelineMessages.length > 0
-              ? visibleActiveMessagesFromTimeline(timelineMessages)
-              : { messages: restored, hasOlder: false };
-          const loadedMessages = loadedWindow.messages;
-          setHistoryHasOlder(activeTimelineHasOlderRef.current);
+              ? timelineMessages
+              : restored;
           if (loadedMessages.length > 0) {
             replaceLoadedMessages(loadedMessages, shouldStickToBottom);
           }
@@ -1123,7 +942,7 @@ export default function AgentChatSection({
             }),
           );
           setWorkDir(detail.work_dir || matchedThread?.work_dir || defaultWorkDir);
-          setRunnerId(detail.runner_id || matchedThread?.runner_id || "bifrost_agent");
+          setRunnerId(detail.runner_id || matchedThread?.runner_id || defaultRunnerId);
         })
         .finally(() => {
           if (!cancelled) {
@@ -1171,7 +990,7 @@ export default function AgentChatSection({
               return changed ? next : prev;
             });
           }
-          setRunnerId(matchedThread?.runner_id || "bifrost_agent");
+          setRunnerId(matchedThread?.runner_id || defaultRunnerId);
           const eventSessionKey =
             pageEvents.find((event) => event.session_key)?.session_key;
           if (nextSessionKey || eventSessionKey) {
@@ -1197,19 +1016,20 @@ export default function AgentChatSection({
       cancelled = true;
     };
   }, [
+    defaultRunnerId,
     defaultWorkDir,
     applyHistoryEventWindow,
     queryHistoryPath,
     querySessionKey,
+    replaceLoadedMessages,
     resetHistoryEventWindow,
     setSearchParams,
-    visibleActiveMessagesFromTimeline,
   ]);
 
   const mergeTimelineEvents = useCallback(
     (
       events: HistoryEvent[],
-      page: Pick<HistoryPagePayload, "start_index" | "end_index" | "next_cursor" | "has_more">,
+      page: Pick<HistoryPagePayload, "start_index" | "end_index">,
       shouldStickToBottom: boolean,
       authoritativeThread?: AgentThreadSummary,
     ) => {
@@ -1227,7 +1047,6 @@ export default function AgentChatSection({
           ? [...historyEventsRef.current, ...events]
           : events;
       const previousStartIndex = historyEventStartIndexRef.current;
-      const previousOlderCursor = historyOlderCursorRef.current;
       const wasAppending =
         startIndex !== undefined && currentEnd !== undefined && startIndex >= currentEnd;
       const { nextTelemetry } = applyHistoryEventWindow(
@@ -1238,11 +1057,6 @@ export default function AgentChatSection({
       );
       if (wasAppending) {
         historyEventStartIndexRef.current = previousStartIndex ?? startIndex;
-        historyOlderCursorRef.current =
-          previousOlderCursor ?? historyEventStartIndexRef.current;
-        setHistoryHasOlder(
-          historyOlderCursorRef.current !== undefined && historyOlderCursorRef.current > 0,
-        );
       }
       return nextTelemetry;
     },
@@ -1426,8 +1240,6 @@ export default function AgentChatSection({
     if (isUninitializedDraftSession) {
       setWorkDir(selectedWorkDir);
       setRunnerId(newChatRunnerId);
-      setComposerMode(undefined);
-      setActiveCollaborationMode(undefined);
       setNewChatOpen(false);
       return;
     }
@@ -1438,8 +1250,6 @@ export default function AgentChatSection({
     setMessages([]);
     setDraft("");
     setSlashRunner(undefined);
-    setComposerMode(undefined);
-    setActiveCollaborationMode(undefined);
     setTelemetry(EMPTY_TELEMETRY);
     setQueuedInputs([]);
     setRunning(false);
@@ -1480,7 +1290,6 @@ export default function AgentChatSection({
     loadedConversationKeyRef.current = "draft";
     selectedHistoryPathRef.current = undefined;
     selectedSessionKeyRef.current = nextSessionKey;
-    activeDetailMessagesRef.current = [];
     pendingInstantScrollRef.current = true;
     setMessages(STARTER_MESSAGES);
     setDraft("");
@@ -1490,8 +1299,6 @@ export default function AgentChatSection({
     setRunning(false);
     setSupplementSubmitting(false);
     setSlashRunner(undefined);
-    setComposerMode(undefined);
-    setActiveCollaborationMode(undefined);
     setWorkDir(defaultWorkDir);
     setRunnerId(defaultRunnerId);
     setNewChatRunnerId(defaultRunnerId);
@@ -1527,13 +1334,11 @@ export default function AgentChatSection({
       setDraft("");
       setSupplementSubmitting(false);
       setTelemetry(telemetryFromThread(thread));
-      setComposerMode(undefined);
-      setActiveCollaborationMode(undefined);
       setQueuedInputs(
         queueItemsFromUnknown(thread.queueItems ?? thread.queue_items) ?? [],
       );
       setWorkDir(thread.work_dir || defaultWorkDir);
-      setRunnerId(thread.runner_id || "bifrost_agent");
+      setRunnerId(thread.runner_id || defaultRunnerId);
       pendingInstantScrollRef.current = true;
       if (!thread.history_path) {
         setMessages(STARTER_MESSAGES);
@@ -1601,8 +1406,6 @@ export default function AgentChatSection({
           setQueuedInputs([]);
           setDraft("");
           setSlashRunner(undefined);
-          setComposerMode(undefined);
-          setActiveCollaborationMode(undefined);
           pendingInstantScrollRef.current = true;
           setSearchParams(
             (prev) => {
@@ -1707,7 +1510,7 @@ export default function AgentChatSection({
             ? "Queueing..."
             : "Injecting guide...",
       timestamp: Date.now() / 1000,
-      meta: "Bifrost Agent",
+      meta: "Runner",
     };
     if (rendersMessage) {
       pendingInstantScrollRef.current = true;
@@ -1838,7 +1641,6 @@ export default function AgentChatSection({
     contentOverride?: string;
     imagesOverride?: PendingChatImage[];
     runnerIdOverride?: string;
-    silentCommand?: boolean;
   }) => {
     const rawContent = (options?.contentOverride ?? draft).trim();
     const imagesForSend = options?.imagesOverride ?? (options?.contentOverride ? [] : pendingImages);
@@ -1849,36 +1651,13 @@ export default function AgentChatSection({
       await handleRunningInput(rawContent);
       return;
     }
-    const parsedPlanSlash = builtInAgentCommandsSupported
-      ? parseAgentPlanSlash(rawContent)
-      : { message: rawContent };
-    const collaborationMode =
-      builtInAgentCommandsSupported
-        ? parsedPlanSlash.collaborationMode || composerMode
-        : undefined;
-    const content = parsedPlanSlash.message.trim();
-    const compactCommand = builtInAgentCommandsSupported && rawContent === "/compact";
-    const telemetryRunnerId =
-      telemetry.status?.runner_id && telemetry.status.runner_id !== "bifrost_agent"
-        ? telemetry.status.runner_id
-        : undefined;
+    const content = rawContent;
+    const telemetryRunnerId = telemetry.status?.runner_id;
     const activeRunnerId = options?.runnerIdOverride || telemetryRunnerId || runnerId;
     const activeRunnerAdapter = selectedRunnerAdapter(runnerOptions, activeRunnerId);
     const runnerModelCommand = isRunnerModelSlashCommand(rawContent, activeRunnerAdapter);
-    const controlCommand =
-      compactCommand ||
-      runnerModelCommand ||
-      (builtInAgentCommandsSupported && options?.silentCommand === true);
-    const hiddenControlCommand =
-      compactCommand ||
-      (builtInAgentCommandsSupported &&
-        options?.silentCommand === true &&
-        !runnerModelCommand);
+    const controlCommand = runnerModelCommand;
     if (!content && imagesForSend.length === 0) {
-      if (collaborationMode === "plan" && imagesForSend.length === 0) {
-        antdMessage.warning("Type a task to start Plan Mode.");
-        setComposerMode("plan");
-      }
       return;
     }
     if (slashRunner && !running && !controlCommand) {
@@ -1899,40 +1678,18 @@ export default function AgentChatSection({
     const assistantMessage: ChatMessage = {
       id: assistantId,
       role: runnerModelCommand ? "system" : "assistant",
-      content: controlCommand ? "" : collaborationMode === "plan" ? "Planning..." : "Agent is running...",
+      content: controlCommand ? "" : "Agent is running...",
       timestamp: Date.now() / 1000,
-      meta: runnerModelCommand ? "System" : "Bifrost Agent",
-      processSteps: compactCommand
-        ? [
-            {
-              type: "compaction",
-              summary: "上下文正在自动压缩",
-              status: "running",
-            },
-          ]
-        : collaborationMode === "plan"
-          ? [
-              {
-                type: "status",
-                summary: "Plan Mode: drafting an implementation plan",
-                status: "running",
-              },
-            ]
-          : undefined,
+      meta: runnerModelCommand ? "System" : "Runner",
     };
     pendingInstantScrollRef.current = true;
     setMessages((prev) => {
       if (runnerModelCommand) {
         return prev;
       }
-      if (hiddenControlCommand) {
-        return [...prev, assistantMessage];
-      }
       return [...prev, userMessage, assistantMessage];
     });
     setDraft("");
-    setComposerMode(undefined);
-    setActiveCollaborationMode(collaborationMode);
     setPendingImages([]);
     setRunning(true);
     setTelemetry((prev) => ({
@@ -1941,11 +1698,8 @@ export default function AgentChatSection({
       status: {
         ...(prev.status || {}),
         work_dir: workDir || undefined,
-        runner_id: activeRunnerId === "bifrost_agent" ? undefined : activeRunnerId,
-        runner_type:
-          activeRunnerId === "bifrost_agent"
-            ? "bifrost_agent"
-            : selectedRunnerAdapter(runnerOptions, activeRunnerId),
+        runner_id: activeRunnerId,
+        runner_type: selectedRunnerAdapter(runnerOptions, activeRunnerId),
       },
       plan: [],
       tools: [],
@@ -1953,9 +1707,8 @@ export default function AgentChatSection({
     }));
     // Ensure the current session is visible in the threads list with first message as fallback title
     setThreads((prev) => {
-      const fallbackTitle = hiddenControlCommand
-        ? currentSessionFallbackTitle || (compactCommand ? "Context compaction" : "Runner command")
-        : userVisibleContent.length > 40 ? `${userVisibleContent.slice(0, 40)}…` : userVisibleContent;
+      const fallbackTitle =
+        userVisibleContent.length > 40 ? `${userVisibleContent.slice(0, 40)}…` : userVisibleContent;
       return dedupeThreads([
         {
           session_key: sessionKey,
@@ -1965,11 +1718,8 @@ export default function AgentChatSection({
           start_time: Math.floor(Date.now() / 1000),
           last_active_time: Math.floor(Date.now() / 1000),
           duration_secs: 0,
-          runner_id: activeRunnerId === "bifrost_agent" ? undefined : activeRunnerId,
-          runner_type:
-            activeRunnerId === "bifrost_agent"
-              ? "bifrost_agent"
-              : selectedRunnerAdapter(runnerOptions, activeRunnerId),
+          runner_id: activeRunnerId,
+          runner_type: selectedRunnerAdapter(runnerOptions, activeRunnerId),
           work_dir: workDir || undefined,
         },
         ...prev.filter((thread) => thread.session_key !== sessionKey),
@@ -1982,9 +1732,8 @@ export default function AgentChatSection({
     let assistantSegmentId = assistantId;
     let assistantSegmentIndex = 0;
     let assistantSegmentHasText = false;
-    let assistantSegmentHasSteps = compactCommand;
+    let assistantSegmentHasSteps = false;
     let assistantSegmentHasProposedPlan = false;
-    let nextAssistantDeltaStartsSegment = false;
     try {
 
       const appendAssistantSegment = (initialContent = "") => {
@@ -1993,13 +1742,12 @@ export default function AgentChatSection({
         assistantSegmentId = `assistant-${Date.now()}-${assistantSegmentIndex}`;
         assistantSegmentHasText = initialContent.trim().length > 0;
         assistantSegmentHasSteps = false;
-        nextAssistantDeltaStartsSegment = false;
         const message: ChatMessage = {
           id: assistantSegmentId,
           role: "assistant",
           content: initialContent,
           timestamp: Date.now() / 1000,
-          meta: "Bifrost Agent",
+          meta: "Runner",
         };
         setMessages((prev) => [
           ...prev.map((item) =>
@@ -2009,38 +1757,6 @@ export default function AgentChatSection({
         ]);
       };
 
-      const appendAssistantDelta = (delta: string) => {
-        if (!delta) {
-          return;
-        }
-        if (
-          nextAssistantDeltaStartsSegment &&
-          (assistantSegmentHasText || assistantSegmentHasSteps)
-        ) {
-          appendAssistantSegment();
-        }
-        const targetId = assistantSegmentId;
-        const segmentHadText = assistantSegmentHasText;
-        setMessages((prev) =>
-          prev.map((message) => {
-            if (message.id !== targetId) {
-              return message;
-            }
-            const nextContent =
-              !segmentHadText &&
-              (message.content === "Agent is running..." || message.content === "Planning...")
-                ? delta
-                : `${message.content}${delta}`;
-            return {
-              ...message,
-              content: nextContent,
-            };
-          }),
-        );
-        assistantSegmentHasText =
-          assistantSegmentHasText || delta.trim().length > 0;
-        nextAssistantDeltaStartsSegment = false;
-      };
 
       const appendProcessStep = (step: ProcessStep) => {
         const targetId = assistantSegmentId;
@@ -2049,7 +1765,7 @@ export default function AgentChatSection({
           prev.map((message) =>
             message.id === targetId
               ? (() => {
-                  const processSteps = [...(message.processSteps || [])];
+                  let processSteps = [...(message.processSteps || [])];
                   if (step.type === "compaction") {
                     const runningCompactionIndex = processSteps.findIndex(
                       (item) => item.type === "compaction" && item.status === "running",
@@ -2060,13 +1776,13 @@ export default function AgentChatSection({
                       processSteps.push(step);
                     }
                   } else {
-                    processSteps.push(step);
+                    processSteps = appendProcessStepToTimeline(processSteps, step);
                   }
                   return {
                     ...message,
                     content:
                       !segmentHadText &&
-                      (message.content === "Agent is running..." || message.content === "Planning...")
+                      message.content === "Agent is running..."
                         ? ""
                         : message.content,
                     processSteps,
@@ -2076,32 +1792,6 @@ export default function AgentChatSection({
           ),
         );
         assistantSegmentHasSteps = true;
-      };
-
-      const finishSilentCommandCompaction = (
-        status: "success" | "failed",
-        summary: string,
-      ) => {
-        setMessages((prev) =>
-          prev.map((message) => {
-            if (message.id !== assistantId) {
-              return message;
-            }
-            const processSteps = [...(message.processSteps || [])];
-            const runningCompactionIndex = processSteps.findIndex(
-              (item) => item.type === "compaction" && item.status === "running",
-            );
-            if (runningCompactionIndex < 0) {
-              return message;
-            }
-            processSteps[runningCompactionIndex] = {
-              ...processSteps[runningCompactionIndex],
-              status,
-              summary,
-            };
-            return { ...message, content: "", processSteps };
-          }),
-        );
       };
 
       const updateRunningToolStep = (
@@ -2157,7 +1847,6 @@ export default function AgentChatSection({
           return prev;
         });
         assistantSegmentHasSteps = true;
-        nextAssistantDeltaStartsSegment = true;
       };
 
       const updateRunningToolPreview = (toolResult: string, durationMs?: number) => {
@@ -2326,21 +2015,10 @@ export default function AgentChatSection({
         workDir: workDir || undefined,
         runnerId: activeRunnerId,
         runnerAdapter: activeRunnerAdapter,
-        collaborationMode,
         signal: abortController.signal,
         onEvent: (event) => {
           if (selectedSessionKeyRef.current !== sendSessionKey) return;
           setTelemetry((prev) => reduceTelemetry(prev, event));
-          if (compactCommand) {
-            const step = eventToProcessStep(event);
-            if (step?.type === "compaction") {
-              appendProcessStep(step);
-            }
-            return;
-          }
-          if (hiddenControlCommand) {
-            return;
-          }
           if (event.eventType === "proposed_plan" && typeof event.content === "string") {
             appendProposedPlan(event.content);
             return;
@@ -2362,14 +2040,6 @@ export default function AgentChatSection({
               });
               return changed ? next : prev;
             });
-          }
-          if (
-            event.eventType === "assistant_delta" &&
-            typeof event.content === "string" &&
-            runnerId === "bifrost_agent"
-          ) {
-            appendAssistantDelta(event.content);
-            return;
           }
           if (event.eventType === "tool_started") {
             const toolStep = eventToProcessStep(event);
@@ -2408,10 +2078,6 @@ export default function AgentChatSection({
         },
         onFinal: (response) => {
           if (selectedSessionKeyRef.current !== sendSessionKey) return;
-          if (compactCommand) {
-            finishSilentCommandCompaction("success", "上下文已自动压缩");
-            return;
-          }
           if (runnerModelCommand) {
             appendSystemDisplayMessage(
               runnerModelSlashSystemDisplayContent(rawContent, response),
@@ -2439,24 +2105,7 @@ export default function AgentChatSection({
       setMessages((prev) =>
         prev.map((message) =>
           message.id === assistantSegmentId
-            ? compactCommand
-              ? {
-                  ...message,
-                  content: "",
-                  processSteps: [
-                    ...(message.processSteps || []).filter(
-                      (step) =>
-                        !(step.type === "compaction" && step.status === "running"),
-                    ),
-                    {
-                      type: "compaction",
-                      summary: "上下文压缩失败",
-                      status: "failed",
-                      result: text,
-                    },
-                  ],
-                }
-              : {
+            ? {
                   ...message,
                   content: text,
                   processSteps: [
@@ -2490,7 +2139,6 @@ export default function AgentChatSection({
     } finally {
       if (selectedSessionKeyRef.current === sendSessionKey) {
         setRunning(false);
-        setActiveCollaborationMode(undefined);
       }
       if (streamAbortRef.current === abortController) {
         streamAbortRef.current = null;
@@ -2553,19 +2201,13 @@ export default function AgentChatSection({
         input?.setSelectionRange(cursor, cursor);
       }, 0);
     };
-    if (option.value === "plan") {
-      setComposerMode("plan");
-      setDraft("");
-      focusComposerAtEnd("");
-      return;
-    }
     if (option.action === "insert") {
       const inserted = option.insertText || `${option.command} `;
       setDraft(inserted);
       focusComposerAtEnd(inserted);
       return;
     }
-    void handleSend({ contentOverride: option.command, silentCommand: true });
+    void handleSend({ contentOverride: option.command });
   };
 
   const updateSlashActiveIndex = useCallback((nextIndex: number | ((index: number) => number)) => {
@@ -2611,7 +2253,6 @@ export default function AgentChatSection({
       return false;
     }
     setSlashRunner(runner);
-    setComposerMode(undefined);
     setDraft("");
     return true;
   }, [
@@ -2688,14 +2329,8 @@ export default function AgentChatSection({
         start_time: Math.floor(message.timestamp || Date.now() / 1000),
         last_active_time: Math.floor(Date.now() / 1000),
         duration_secs: 0,
-        runner_id:
-          runnerCall.targetRunnerId === "bifrost_agent"
-            ? undefined
-            : runnerCall.targetRunnerId,
-        runner_type:
-          runnerCall.targetRunnerId === "bifrost_agent"
-            ? "bifrost_agent"
-            : runnerCall.targetAdapter || runnerCall.targetRunnerId,
+        runner_id: runnerCall.targetRunnerId,
+        runner_type: runnerCall.targetAdapter || runnerCall.targetRunnerId,
         work_dir: workDir || undefined,
       });
     },
@@ -2746,11 +2381,6 @@ export default function AgentChatSection({
                 >
                   {currentStateTag}
                 </Tag>
-                {activeCollaborationMode === "plan" ? (
-                  <Tag color="gold" data-testid="agent-chat-active-plan-mode">
-                    Plan Mode
-                  </Tag>
-                ) : null}
               </Space>
             </div>
           }
@@ -2783,18 +2413,6 @@ export default function AgentChatSection({
             style={styles.conversation}
           >
             <div style={styles.conversationTrack} data-testid="agent-chat-message-track">
-              {showLoadOlder ? (
-                <div style={{ display: "flex", justifyContent: "center", padding: "4px 0 8px" }}>
-                  <Button
-                    size="small"
-                    loading={historyLoadingOlder}
-                    onClick={loadOlderHistoryPage}
-                    data-testid="agent-chat-load-older"
-                  >
-                    Load older
-                  </Button>
-                </div>
-              ) : null}
               {messages.length === 0 ? (
                 <div
                   data-testid="agent-chat-empty-state"
@@ -2928,7 +2546,6 @@ export default function AgentChatSection({
                   }}
                   onSelect={(option) => {
                     setSlashRunner(option);
-                    setComposerMode(undefined);
                     setDraft("");
                   }}
                 />
@@ -2961,14 +2578,10 @@ export default function AgentChatSection({
                   }}
                   onPaste={handlePasteImages}
                   onKeyDown={handleComposerKeyDown}
-                  placeholder={
-                    composerMode === "plan"
-                      ? "Describe what should be planned..."
-                      : "Describe a task for the Agent..."
-                  }
+                  placeholder="Describe a task for the Agent..."
                   autoSize={{ minRows: 2, maxRows: 7 }}
                   style={{
-                    padding: slashRunner || composerMode === "plan"
+                    padding: slashRunner
                       ? "42px 56px 30px 14px"
                       : "8px 56px 30px 14px",
                     border: "none",
@@ -2978,25 +2591,8 @@ export default function AgentChatSection({
                     resize: "none",
                   }}
                 />
-                {composerMode === "plan" ? (
-                  <Tag
-                    color="gold"
-                    data-testid="agent-chat-plan-mode-pill"
-                    style={styles.planModePill}
-                    closable
-                    onClose={(event) => {
-                      event.preventDefault();
-                      setComposerMode(undefined);
-                    }}
-                  >
-                    <BulbOutlined style={{ marginRight: 4 }} />
-                    Plan Mode
-                  </Tag>
-                ) : null}
                 <Text style={styles.inputHint} data-testid="agent-chat-input-hint">
-                  {composerMode === "plan"
-                    ? "Planning only. Shift + Enter for a new line"
-                    : "Shift + Enter for a new line"}
+                  Shift + Enter for a new line
                 </Text>
                 <Button
                   shape="circle"

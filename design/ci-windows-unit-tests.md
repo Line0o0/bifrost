@@ -58,12 +58,12 @@ Bifrost 需要在 Parallels Windows VM 与 GitHub Actions `windows-latest` runne
 ### 必须真实验证
 
 - Windows VM 本地跑 `cargo test --workspace --all-features -j1`，输出全绿并记录到 `human_tests/ci-windows-unit-tests.md`。
-- 受影响 targeted tests 在 VM 内单独复跑（`bifrost-agent exec_command`、`bifrost-admin` IM Gateway、`skills` watcher、`bifrost-core` launchd parser、`bifrost-device` iOS/Android helper 编译）。
+- 受影响 targeted tests 在 VM 内单独复跑（`bifrost-admin` IM Gateway、`skills` watcher、`bifrost-core` launchd parser、`bifrost-device` iOS/Android helper 编译）。
 - `cargo clippy --workspace --all-targets --all-features -j1 -- -D warnings` 在 Windows 上通过。
 - GitHub Actions `Windows Unit Tests (x86_64)` 在 CI 上：
   - 主体测试全绿。
   - `Post Run Swatinem/rust-cache@v2` 不再出现因保存 cache 失败让 job 红灯的情况。
-- E2E / 集成兜底：`cargo test -p bifrost-agent --test p1_tools_e2e` 与 `cargo test -p bifrost-tests --test https_proxy_test` 在 Windows VM 内通过。
+- E2E / 集成兜底：`cargo test -p bifrost-tests --test https_proxy_test` 在 Windows VM 内通过。
 
 ## 产品语义
 
@@ -71,7 +71,6 @@ Bifrost 需要在 Parallels Windows VM 与 GitHub Actions `windows-latest` runne
 
 - Skills registry watcher 在 Windows 上删除路径时，缓存立即清理，与 macOS/Linux 一致；用户不会看到"已删除的 skill 仍出现在列表"的过时状态。
 - HTTPS H2 → HTTP/1.1 fallback 后，客户端拿到的响应体完整且 header 规范；不会因 body decode 错误影响 Chat/IM 场景。
-- Agent `exec_command` 在 Windows 上允许长命令通过 poll 拿输出，交互式 stdin 用例移到非硬性断言，不影响非 Windows 用户体验。
 
 ## 技术细节
 
@@ -176,7 +175,6 @@ test-windows-tray:
 
 覆盖修复涉及的所有 crate：
 
-- `bifrost-agent`：`exec_command` Windows / Unix 分支覆盖，P1 tools E2E `--test p1_tools_e2e`。
 - `bifrost-admin`：IM Gateway external CLI Windows `taskkill` PID 消失分支。
 - `bifrost-tests`：`https_proxy_test` H2 body reset fallback 用例。
 - `skills`：registry watcher raw/canonical remove 事件。
@@ -186,7 +184,6 @@ test-windows-tray:
 
 ### 集成 & E2E 测试
 
-- `cargo test -p bifrost-agent --test p1_tools_e2e` 在 Windows VM 通过。
 - `cargo test -p bifrost-tests --test https_proxy_test` 在 Windows VM 通过。
 - CI `test-windows-tray` job 在 GitHub Actions 通过。
 - Workspace 兜底：至少一次完整 `cargo test --workspace --all-features -j1`（本地 VM）。
@@ -236,3 +233,35 @@ test-windows-tray:
 - 更新 `human_tests/ci-windows-unit-tests.md`
 - 更新 `human_tests/readme.md`
 - 本修复不新增 CLI/API 配置项，不需要更新 README
+
+## 2026-07-14 端口探测单测竞争补充
+
+PR #386 的 CI run `29307008072` 在 `Windows Unit Tests (x86_64)` 中失败于
+`is_port_in_use_uses_fallback_socketaddr_on_parse_failure`。旧测试通过
+`allocate_loopback_port()` 获取端口后立即释放 listener，再断言端口未占用；释放与断言之间存在
+TOCTOU 窗口，Windows 并行测试或系统服务可抢占该端口。
+
+稳定化方案不修改 `is_port_in_use()` 产品逻辑，只修测试夹具：
+
+- 测试在 `127.0.0.1:0` 建立 listener 并保持其存活。
+- 使用非法 host 强制进入 fallback `127.0.0.1` 的连接探测。
+- 断言 fallback 能检测到仍被 listener 占用的端口。
+
+该断言同时验证 fallback 语义且不存在“释放后等待别人不要抢端口”的时间窗口；本地目标用例需
+重复执行，最终由 GitHub Actions Windows Unit Tests 补验。
+
+## 2026-07-14 external CLI mock 进程测试预算补充
+
+`cargo test --workspace --all-features` 在高并发负载下稳定暴露
+`external_cli_runtime_dispatches_default_claude_stream_json_transport` 的 5 秒超时。保留失败产物
+诊断确认 mock Python 进程能够正确接收 user frame、输出 assistant/result frame，产品侧
+stream-json 解析和超时判定均正常；不稳定点是集成式测试把可执行文件版本探测、Python 启动和
+完整进程往返压在 5 秒预算内，当前高负载机器一次正常成功已耗时约 4.35 秒。
+
+稳定化统一调整这组 Unix stream-json mock 进程测试的运行预算为 15 秒，并把 interrupt marker
+等待统一到已有的 10 秒有界 helper；不修改产品默认超时或超时判定逻辑。该预算仍能快速暴露
+真正的子进程挂死，同时给 workspace 并行编译/测试和 Windows/macOS 进程启动留下调度余量。
+
+第二次 workspace 全量复测进一步暴露 `pending_guide_rejects_parallel_redirect` 的 3 秒 marker
+等待和 `replaced_session_rejects_direct_guide_command` 的 5 秒 mock run 预算不足，因此不能只放宽
+最先失败的 runtime dispatch 用例，必须统一消除同一模块内的脆弱硬编码预算。

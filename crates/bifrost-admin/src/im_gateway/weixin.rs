@@ -17,13 +17,16 @@ use bifrost_core::Result;
 use crate::im_gateway::provider::{EventSink, ImProvider};
 use crate::im_gateway::types::{
     ConnectionHandle, ImEvent, ImEventMessage, ImEventSource, ImImageAttachment, ImImageSource,
-    ImProviderConfig, ImProviderType, ImTarget, ProviderValidation, SendOptions, SendResult,
-    UploadedImage,
+    ImMessageReference, ImProviderConfig, ImProviderType, ImTarget, ProviderValidation,
+    SendOptions, SendResult, UploadedImage,
 };
 
 const DEFAULT_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
 const DEFAULT_CDN_BASE_URL: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
 const DEFAULT_POLL_INTERVAL_MS: u64 = 3_000;
+const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const LOGIN_HTTP_TIMEOUT: Duration = Duration::from_secs(75);
+const LOGIN_QR_EXPIRES_IN_SECONDS: u64 = 60;
 const TEXT_RETRY_CHUNK_MAX_CHARS: usize = 1_000;
 const TEXT_RETRY_CHUNK_MAX_BYTES: usize = 3_000;
 
@@ -60,6 +63,7 @@ struct OutboundImage {
 
 pub struct WeixinProvider {
     http: reqwest::Client,
+    login_http: reqwest::Client,
     runtime: Arc<RwLock<HashMap<String, AccountRuntime>>>,
     outbound_images: Arc<RwLock<HashMap<String, OutboundImage>>>,
 }
@@ -72,12 +76,21 @@ impl Default for WeixinProvider {
 
 impl WeixinProvider {
     pub fn new() -> Self {
+        Self::with_http_timeouts(DEFAULT_HTTP_TIMEOUT, LOGIN_HTTP_TIMEOUT)
+    }
+
+    fn with_http_timeouts(default_timeout: Duration, login_timeout: Duration) -> Self {
         let http = bifrost_core::outbound_reqwest_client_builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(default_timeout)
+            .build()
+            .unwrap_or_default();
+        let login_http = bifrost_core::outbound_reqwest_client_builder()
+            .timeout(login_timeout)
             .build()
             .unwrap_or_default();
         Self {
             http,
+            login_http,
             runtime: Arc::new(RwLock::new(HashMap::new())),
             outbound_images: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -131,7 +144,7 @@ impl WeixinProvider {
             url: Option<String>,
         }
         let body: QrResponse = self
-            .http
+            .login_http
             .get(url)
             .header("iLink-App-ClientVersion", "1")
             .send()
@@ -160,7 +173,7 @@ impl WeixinProvider {
         Ok(WeixinLoginStart {
             poll_key,
             scan_url,
-            expires_in_seconds: 60,
+            expires_in_seconds: LOGIN_QR_EXPIRES_IN_SECONDS,
         })
     }
 
@@ -181,7 +194,7 @@ impl WeixinProvider {
                 urlencoding::encode(poll_key)
             );
             let status: serde_json::Value = self
-                .http
+                .login_http
                 .get(url)
                 .header("iLink-App-ClientVersion", "1")
                 .send()
@@ -361,6 +374,7 @@ impl WeixinProvider {
         )
         .unwrap_or_else(|| format!("weixin-{}-{:016x}", account_id, stable_hash(&raw_json)));
         let images = Self::message_images(&update);
+        let reply_to = Self::message_reference(&update);
         let mut text = Self::message_text(&update);
         if text.trim().is_empty() && images.is_empty() {
             text = truncate_chars(&raw_json, 2_000);
@@ -390,6 +404,7 @@ impl WeixinProvider {
                 text,
                 mentions: Vec::new(),
                 images,
+                reply_to,
                 raw_type: Some(raw_type),
             }),
             received_at: now_ms(),
@@ -419,6 +434,8 @@ impl WeixinProvider {
             return Self::extract_text_from_string(&text);
         }
         for pointer in [
+            "/text_item/text",
+            "/text_item/content",
             "/content/text",
             "/content/content",
             "/message/text",
@@ -447,6 +464,30 @@ impl WeixinProvider {
             }
         }
         String::new()
+    }
+
+    fn message_reference(value: &serde_json::Value) -> Option<ImMessageReference> {
+        let items = value.get("item_list")?.as_array()?;
+        items.iter().find_map(|item| {
+            let reference = item.pointer("/ref_msg/message_item")?;
+            let message_id = Self::string_or_number_field(
+                reference,
+                &["msg_id", "message_id", "id", "client_msg_id", "new_msg_id"],
+            );
+            let created_at_ms = Self::u64_field(
+                reference,
+                &["create_time_ms", "created_at_ms", "timestamp_ms"],
+            );
+            let text = Self::message_text(reference).trim().to_string();
+            let text = (!text.is_empty()).then_some(text);
+            (message_id.is_some() || created_at_ms.is_some() || text.is_some()).then_some(
+                ImMessageReference {
+                    message_id,
+                    created_at_ms,
+                    text,
+                },
+            )
+        })
     }
 
     fn message_images(value: &serde_json::Value) -> Vec<ImImageAttachment> {
@@ -582,6 +623,17 @@ impl WeixinProvider {
                     .map(str::to_string)
                     .or_else(|| v.as_u64().map(|n| n.to_string()))
                     .or_else(|| v.as_i64().map(|n| n.to_string()))
+            })
+        })
+    }
+
+    fn u64_field(value: &serde_json::Value, keys: &[&str]) -> Option<u64> {
+        keys.iter().find_map(|key| {
+            value.get(*key).and_then(|field| {
+                field
+                    .as_u64()
+                    .or_else(|| field.as_i64().and_then(|number| u64::try_from(number).ok()))
+                    .or_else(|| field.as_str().and_then(|number| number.parse().ok()))
             })
         })
     }
@@ -1077,6 +1129,7 @@ impl ImProvider for WeixinProvider {
         let config = config.clone();
         let provider = Self {
             http: self.http.clone(),
+            login_http: self.login_http.clone(),
             runtime: Arc::clone(&self.runtime),
             outbound_images: Arc::clone(&self.outbound_images),
         };

@@ -86,8 +86,6 @@ pub(super) async fn run_event_loop(
     route_store: Arc<ImRouteStore>,
     provider_store: Arc<ImProviderStore>,
     agent_config_store: Arc<ImAgentConfigStore>,
-    agent_client: Arc<ImAgentClient>,
-    agent_tools: Arc<ImAgentToolRegistry>,
     schedule_store: Arc<ImScheduleStore>,
     scheduler: Arc<ImScheduler>,
     target_store: Arc<ImTargetStore>,
@@ -106,8 +104,6 @@ pub(super) async fn run_event_loop(
         route_store,
         provider_store,
         agent_config_store,
-        agent_client,
-        agent_tools,
         schedule_store,
         scheduler,
         target_store,
@@ -131,12 +127,10 @@ pub(super) async fn run_event_loop_with_options(
     route_store: Arc<ImRouteStore>,
     provider_store: Arc<ImProviderStore>,
     agent_config_store: Arc<ImAgentConfigStore>,
-    agent_client: Arc<ImAgentClient>,
-    agent_tools: Arc<ImAgentToolRegistry>,
-    schedule_store: Arc<ImScheduleStore>,
-    scheduler: Arc<ImScheduler>,
-    target_store: Arc<ImTargetStore>,
-    connection_manager: Arc<ImConnectionManager>,
+    _schedule_store: Arc<ImScheduleStore>,
+    _scheduler: Arc<ImScheduler>,
+    _target_store: Arc<ImTargetStore>,
+    _connection_manager: Arc<ImConnectionManager>,
     agent_session_manager: Arc<ImAgentSessionManager>,
     external_cli_config_store: Arc<crate::im_gateway::external_cli::ExternalCliConfigStore>,
     queue_manager: Arc<SessionQueueManager>,
@@ -166,26 +160,6 @@ pub(super) async fn run_event_loop_with_options(
                 info!(removed, "cleaned up expired session files (>90 days)");
             }
         }
-    }
-
-    let mcp_http_network = agent_client
-        .model_proxy_url()
-        .map(|proxy_url| {
-            bifrost_agent::mcp::McpHttpNetwork::with_proxy_and_ca(
-                proxy_url.to_string(),
-                Some(bifrost_storage::data_dir().join("certs").join("ca.crt")),
-            )
-        })
-        .unwrap_or_else(bifrost_agent::mcp::McpHttpNetwork::direct);
-    let mut mcp_manager =
-        ImMcpManager::new_with_http_network(&init_config.mcp_servers, mcp_http_network).await;
-    let mcp_tool_count = mcp_manager.list_tools().len();
-    if mcp_tool_count > 0 {
-        info!(
-            provider_id = %provider.id,
-            mcp_tools = mcp_tool_count,
-            "MCP manager initialized with tools"
-        );
     }
 
     // Send online notification to owner on connect
@@ -234,6 +208,7 @@ pub(super) async fn run_event_loop_with_options(
                 message_id,
                 msg_type: Some(outbound_log_msg_type(&provider, "text")),
                 content_preview: Some(online_msg.to_string()),
+                content: Some(online_msg.to_string()),
                 trigger: Some("online".to_string()),
                 error: error_msg,
                 sender_open_id: None,
@@ -311,6 +286,11 @@ pub(super) async fn run_event_loop_with_options(
                         message_id: event.source.message_id.clone(),
                         msg_type: event.message.as_ref().and_then(|m| m.raw_type.clone()),
                         content_preview: event.message.as_ref().map(inbound_message_preview),
+                        content: event
+                            .message
+                            .as_ref()
+                            .map(|message| message.text.clone())
+                            .filter(|text| !text.trim().is_empty()),
                         trigger: Some("websocket".to_string()),
                         error: Some(format!("rejected: sender {} is not owner", sender_id)),
                         sender_open_id: Some(sender_id.to_string()),
@@ -369,6 +349,11 @@ pub(super) async fn run_event_loop_with_options(
             message_id: event.source.message_id.clone(),
             msg_type: event.message.as_ref().and_then(|m| m.raw_type.clone()),
             content_preview: event.message.as_ref().map(inbound_message_preview),
+            content: event
+                .message
+                .as_ref()
+                .map(|message| message.text.clone())
+                .filter(|text| !text.trim().is_empty()),
             trigger: Some("websocket".to_string()),
             error: None,
             sender_open_id: event.source.user_id.clone(),
@@ -390,7 +375,13 @@ pub(super) async fn run_event_loop_with_options(
                     if !msg.text.trim().is_empty() || !msg.images.is_empty() {
                         let session_key =
                             build_session_key(&event.provider_id, event.source.user_id.as_deref());
-                        let agent_message = agent_message_text(msg);
+                        let agent_message = agent_message_text_with_reference(
+                            msg,
+                            &event.provider_id,
+                            event.source.user_id.as_deref(),
+                            event.source.message_id.as_deref(),
+                            &message_log_store,
+                        );
                         let effective_agent_config =
                             effective_agent_config_for_provider(&agent_config, &provider);
                         let busy_default_mode = busy_default_mode_for_agent_config(
@@ -413,6 +404,7 @@ pub(super) async fn run_event_loop_with_options(
                                     agent_session_manager: &agent_session_manager,
                                     progress_registry: &progress_registry,
                                     external_cli_config_store: &external_cli_config_store,
+                                    agent_config: &effective_agent_config,
                                     default_mode: busy_default_mode,
                                     status_context: status_context_from_agent_config(
                                         &effective_agent_config,
@@ -448,96 +440,41 @@ pub(super) async fn run_event_loop_with_options(
                             continue;
                         }
 
-                        if let Some(runner_id) = effective_agent_config
+                        let runner_id = effective_agent_config
                             .runner
                             .as_ref()
-                            .and_then(|runner| runner.custom_runner_id())
-                        {
-                            run_external_cli_agent_chat(
-                                ExternalCliChatContext {
-                                    rx: &mut rx,
-                                    client: &client,
-                                    provider: &provider,
-                                    provider_store: &provider_store,
-                                    event: &event,
-                                    message_log_store: &message_log_store,
-                                    agent_config_store: &agent_config_store,
-                                    external_cli_config_store: &external_cli_config_store,
-                                    agent_session_manager: &agent_session_manager,
-                                    queue_manager: &queue_manager,
-                                    progress_registry: &progress_registry,
-                                    event_store: &event_store,
-                                },
-                                ExternalCliChatInput {
-                                    message_text: agent_message,
-                                    images: external_cli_images_from_chat_images(
-                                        resolve_event_images(
-                                            &client,
-                                            &provider,
-                                            &event,
-                                            &msg.images,
-                                        )
+                            .and_then(|runner| runner.custom_runner_id());
+                        run_external_cli_agent_chat(
+                            ExternalCliChatContext {
+                                rx: &mut rx,
+                                client: &client,
+                                provider: &provider,
+                                provider_store: &provider_store,
+                                event: &event,
+                                message_log_store: &message_log_store,
+                                agent_config_store: &agent_config_store,
+                                external_cli_config_store: &external_cli_config_store,
+                                agent_session_manager: &agent_session_manager,
+                                queue_manager: &queue_manager,
+                                progress_registry: &progress_registry,
+                                event_store: &event_store,
+                            },
+                            ExternalCliChatInput {
+                                message_text: agent_message,
+                                images: external_cli_images_from_chat_images(
+                                    resolve_event_images(&client, &provider, &event, &msg.images)
                                         .await,
-                                    ),
-                                    session_key: session_key.clone(),
-                                    adapter_override: None,
-                                    instructions_override: None,
-                                    delivery_override: None,
-                                    runner_id_override: Some(runner_id.to_string()),
-                                    runner_selected: true,
-                                },
-                            )
-                            .await;
-                            continue;
-                        }
-
-                        if matches!(agent_message.trim(), "/clear" | "/reset") {
-                            clear_builtin_im_agent_session(
-                                &agent_session_manager,
-                                &queue_manager,
-                                &session_key,
-                            )
-                            .await;
-                            send_agent_reply(
-                                &client,
-                                &provider,
-                                &event,
-                                "会话已重置，下一条消息将开始新的对话。",
-                                &message_log_store,
-                            )
-                            .await;
-                            continue;
-                        }
-
-                        // Session is free — start processing with select! interleaving
-                        let images =
-                            resolve_event_images(&client, &provider, &event, &msg.images).await;
-                        run_agent_chat_with_interleave(
-                            &mut rx,
-                            &client,
-                            &provider,
-                            &provider_store,
-                            &event,
-                            &agent_client,
-                            &agent_config_store,
-                            &agent_tools,
-                            &schedule_store,
-                            &scheduler,
-                            &target_store,
-                            &connection_manager,
-                            &agent_session_manager,
-                            &queue_manager,
-                            &progress_registry,
-                            &session_key,
-                            &agent_message,
-                            images,
-                            None,
-                            &mut mcp_manager,
-                            &message_log_store,
-                            &event_store,
-                            &external_cli_config_store,
+                                ),
+                                session_key: session_key.clone(),
+                                adapter_override: None,
+                                instructions_override: None,
+                                delivery_override: None,
+                                runner_id_override: runner_id.map(ToString::to_string),
+                                runner_selected: runner_id.is_some(),
+                            },
                         )
                         .await;
+                        continue;
                     }
                 }
             }
@@ -557,7 +494,7 @@ pub(super) async fn run_event_loop_with_options(
                 // Script execution (existing logic, kept as-is for this route type)
                 info!(route_id = %route_match.route.id, "RunScriptAndReply action matched (execution handled by task executor)");
             }
-            ImRouteAction::AgentChat { system_prompt, .. } => {
+            ImRouteAction::AgentChat { .. } => {
                 let raw_message_text = route_match.message_text.as_deref().unwrap_or("");
                 let has_images = event
                     .message
@@ -569,7 +506,15 @@ pub(super) async fn run_event_loop_with_options(
                 let message_text = event
                     .message
                     .as_ref()
-                    .map(agent_message_text)
+                    .map(|message| {
+                        agent_message_text_with_reference(
+                            message,
+                            &event.provider_id,
+                            event.source.user_id.as_deref(),
+                            event.source.message_id.as_deref(),
+                            &message_log_store,
+                        )
+                    })
                     .unwrap_or_else(|| raw_message_text.to_string());
                 let session_key =
                     build_session_key(&event.provider_id, event.source.user_id.as_deref());
@@ -595,6 +540,7 @@ pub(super) async fn run_event_loop_with_options(
                             agent_session_manager: &agent_session_manager,
                             progress_registry: &progress_registry,
                             external_cli_config_store: &external_cli_config_store,
+                            agent_config: &agent_config,
                             default_mode: busy_default_mode,
                             status_context: status_context_from_agent_config(&agent_config),
                             default_work_dir: Some(
@@ -625,102 +571,44 @@ pub(super) async fn run_event_loop_with_options(
                     continue;
                 }
 
-                if let Some(runner_id) = agent_config
+                let runner_id = agent_config
                     .runner
                     .as_ref()
-                    .and_then(|runner| runner.custom_runner_id())
-                {
-                    run_external_cli_agent_chat(
-                        ExternalCliChatContext {
-                            rx: &mut rx,
-                            client: &client,
-                            provider: &provider,
-                            provider_store: &provider_store,
-                            event: &event,
-                            message_log_store: &message_log_store,
-                            agent_config_store: &agent_config_store,
-                            external_cli_config_store: &external_cli_config_store,
-                            agent_session_manager: &agent_session_manager,
-                            queue_manager: &queue_manager,
-                            progress_registry: &progress_registry,
-                            event_store: &event_store,
-                        },
-                        ExternalCliChatInput {
-                            message_text,
-                            images: match event.message.as_ref() {
-                                Some(message) => external_cli_images_from_chat_images(
-                                    resolve_event_images(
-                                        &client,
-                                        &provider,
-                                        &event,
-                                        &message.images,
-                                    )
+                    .and_then(|runner| runner.custom_runner_id());
+                run_external_cli_agent_chat(
+                    ExternalCliChatContext {
+                        rx: &mut rx,
+                        client: &client,
+                        provider: &provider,
+                        provider_store: &provider_store,
+                        event: &event,
+                        message_log_store: &message_log_store,
+                        agent_config_store: &agent_config_store,
+                        external_cli_config_store: &external_cli_config_store,
+                        agent_session_manager: &agent_session_manager,
+                        queue_manager: &queue_manager,
+                        progress_registry: &progress_registry,
+                        event_store: &event_store,
+                    },
+                    ExternalCliChatInput {
+                        message_text,
+                        images: match event.message.as_ref() {
+                            Some(message) => external_cli_images_from_chat_images(
+                                resolve_event_images(&client, &provider, &event, &message.images)
                                     .await,
-                                ),
-                                None => Vec::new(),
-                            },
-                            session_key: session_key.clone(),
-                            adapter_override: None,
-                            instructions_override: None,
-                            delivery_override: None,
-                            runner_id_override: Some(runner_id.to_string()),
-                            runner_selected: true,
+                            ),
+                            None => Vec::new(),
                         },
-                    )
-                    .await;
-                    continue;
-                }
-
-                if matches!(message_text.trim(), "/clear" | "/reset") {
-                    clear_builtin_im_agent_session(
-                        &agent_session_manager,
-                        &queue_manager,
-                        &session_key,
-                    )
-                    .await;
-                    send_agent_reply(
-                        &client,
-                        &provider,
-                        &event,
-                        "会话已重置，下一条消息将开始新的对话。",
-                        &message_log_store,
-                    )
-                    .await;
-                    continue;
-                }
-
-                let images = match event.message.as_ref() {
-                    Some(message) => {
-                        resolve_event_images(&client, &provider, &event, &message.images).await
-                    }
-                    None => Vec::new(),
-                };
-                run_agent_chat_with_interleave(
-                    &mut rx,
-                    &client,
-                    &provider,
-                    &provider_store,
-                    &event,
-                    &agent_client,
-                    &agent_config_store,
-                    &agent_tools,
-                    &schedule_store,
-                    &scheduler,
-                    &target_store,
-                    &connection_manager,
-                    &agent_session_manager,
-                    &queue_manager,
-                    &progress_registry,
-                    &session_key,
-                    &message_text,
-                    images,
-                    system_prompt.as_deref(),
-                    &mut mcp_manager,
-                    &message_log_store,
-                    &event_store,
-                    &external_cli_config_store,
+                        session_key: session_key.clone(),
+                        adapter_override: None,
+                        instructions_override: None,
+                        delivery_override: None,
+                        runner_id_override: runner_id.map(ToString::to_string),
+                        runner_selected: runner_id.is_some(),
+                    },
                 )
                 .await;
+                continue;
             }
             ImRouteAction::ExternalCliAgentChat {
                 adapter,
@@ -803,8 +691,6 @@ pub(super) async fn run_event_loop_with_options(
             }
         }
     }
-
-    mcp_manager.shutdown().await;
 
     info!(
         provider_id = %provider.id,
@@ -1033,6 +919,7 @@ async fn run_external_cli_agent_chat(ctx: ExternalCliChatContext<'_>, input: Ext
                 agent_session_manager: ctx.agent_session_manager,
                 progress_registry: ctx.progress_registry,
                 external_cli_config_store: ctx.external_cli_config_store,
+                agent_config: &provider_agent_config,
                 default_mode: busy_default_mode_for_external_adapter(&settings.adapter),
                 status_context,
                 default_work_dir: Some(
@@ -1171,6 +1058,7 @@ async fn run_external_cli_agent_chat(ctx: ExternalCliChatContext<'_>, input: Ext
             "im_turn_started",
         );
         let mut progress_enabled = false;
+        let mut progress_runner_metadata = std::collections::BTreeMap::new();
         let mut progress_tx_for_finish = None;
         let mut progress_task = None;
         if matches!(
@@ -1250,7 +1138,7 @@ async fn run_external_cli_agent_chat(ctx: ExternalCliChatContext<'_>, input: Ext
             tokio::sync::mpsc::unbounded_channel();
         let request_for_progress = request.clone();
         // Keep the runner control loop independently polled while this task
-        // handles an inbound /g (or the default Guide message). Awaiting the
+        // handles a default Guide message (or a legacy inbound /g). Awaiting the
         // guide acknowledgement inline otherwise stalls `run_with_progress`,
         // which is also responsible for forwarding that guide to the worker.
         let request_for_run = request.clone();
@@ -1282,6 +1170,24 @@ async fn run_external_cli_agent_chat(ctx: ExternalCliChatContext<'_>, input: Ext
                                 "im_progress",
                             );
                         }
+                    }
+                    if progress_enabled
+                        && crate::im_gateway::external_cli::merge_external_cli_progress_metadata(
+                            &settings.adapter,
+                            &progress_event,
+                            &mut progress_runner_metadata,
+                        )
+                    {
+                        let runner_summary = external_cli_progress_runner_summary(
+                            &effective.runner_id,
+                            &settings.adapter,
+                            &request_for_progress,
+                            Some(&progress_runner_metadata),
+                        );
+                        let _ = ctx
+                            .progress_registry
+                            .update_runner_summary(&input.session_key, runner_summary)
+                            .await;
                     }
                     if progress_enabled {
                         if let (Some(progress_tx), Some(agent_event)) = (
@@ -1578,7 +1484,7 @@ async fn run_external_cli_agent_chat(ctx: ExternalCliChatContext<'_>, input: Ext
             None => break,
         };
     }
-    if recorder.is_some() && !session.memory_cleared {
+    if recorder.is_some() && !session.history_cleared {
         session.recorder = recorder;
     }
     remember_session_state_from_agent_session(
@@ -2036,6 +1942,7 @@ fn external_cli_progress_runner_summary(
             .reasoning_source
             .map(|value| format_runner_model_source(&value)),
         token_usage: metadata.and_then(external_cli_token_usage_from_metadata),
+        weekly_usage: metadata.and_then(external_cli_weekly_usage_from_metadata),
         work_dir: request
             .work_dir
             .as_ref()
@@ -2043,6 +1950,18 @@ fn external_cli_progress_runner_summary(
         external_thread_id,
         external_conversation_id,
     }
+}
+
+fn external_cli_weekly_usage_from_metadata(
+    metadata: &std::collections::BTreeMap<String, String>,
+) -> Option<crate::im_gateway::progress_card::ProgressRunnerWeeklyUsage> {
+    Some(
+        crate::im_gateway::progress_card::ProgressRunnerWeeklyUsage {
+            used_percent: metadata_u64(metadata, "codexWeeklyUsedPercent")?.min(100),
+            window_minutes: metadata_u64(metadata, "codexWeeklyWindowMinutes")?,
+            resets_at: metadata_u64(metadata, "codexWeeklyResetsAt"),
+        },
+    )
 }
 
 fn external_cli_token_usage_from_metadata(
@@ -2190,6 +2109,23 @@ mod tests {
         assert_eq!(summary.model.as_deref(), Some("GPT-5.5"));
         assert_eq!(summary.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(summary.reasoning_source.as_deref(), Some("runner 配置"));
+    }
+
+    #[test]
+    fn external_cli_progress_runner_summary_reads_weekly_usage_metadata() {
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert("codexWeeklyUsedPercent".to_string(), "140".to_string());
+        metadata.insert("codexWeeklyWindowMinutes".to_string(), "10080".to_string());
+        metadata.insert("codexWeeklyResetsAt".to_string(), "1784490086".to_string());
+
+        let usage = external_cli_weekly_usage_from_metadata(&metadata)
+            .expect("valid weekly metadata should be rendered");
+
+        assert_eq!(usage.used_percent, 100);
+        assert_eq!(usage.window_minutes, 10_080);
+        assert_eq!(usage.resets_at, Some(1_784_490_086));
+        metadata.remove("codexWeeklyWindowMinutes");
+        assert!(external_cli_weekly_usage_from_metadata(&metadata).is_none());
     }
 
     fn external_cli_result_with_status(

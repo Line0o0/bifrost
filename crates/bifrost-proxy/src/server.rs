@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -37,15 +38,18 @@ use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 
 use crate::dns::DnsResolver;
 use crate::proxy::http::{
-    handle_connect, handle_http_request, requires_client_app_for_tls_decision, SingleCertResolver,
+    handle_connect_with_process_state as handle_connect, handle_http_request,
+    requires_client_app_for_tls_decision, SingleCertResolver,
 };
 use crate::proxy::socks::{SocksConfig, SocksHandler, SocksServer, UdpRelay};
 use crate::unified::{DetectedProtocol, PeekableStream};
 use crate::utils::logging::RequestContext;
+#[cfg(test)]
+use crate::utils::process_info::ClientProcess;
 use crate::utils::process_info::{
-    app_policy_process_resolution_retry_config, resolve_client_process_async_for_connection,
-    resolve_client_process_async_for_connection_with_retry,
-    spawn_async_process_resolver_with_finish, ClientProcess,
+    app_policy_process_resolution_retry_config, resolve_client_process_async_for_connection_shared,
+    resolve_client_process_async_for_connection_with_retry_shared,
+    spawn_async_process_resolver_with_finish, ConnectionProcessState, PROCESS_RESOLVER,
 };
 use bifrost_core::{
     AccessControlConfig, AccessDecision, AccessMode, ClientAccessControl, ProxyAuthRateLimiter,
@@ -128,12 +132,27 @@ fn is_noisy_connection_close(err_debug: &str, err_display: &str) -> bool {
     err_debug.contains("IncompleteMessage") || err_display.contains("message completed")
 }
 
-fn should_defer_client_process_resolution(_method: &Method, _verbose_logging: bool) -> bool {
-    false
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientProcessResolutionMode {
+    SkipAdmin,
+    SyncAppPolicy,
+    Normal,
 }
 
-fn is_admin_request_path(path: &str) -> bool {
-    path == "/_bifrost" || path.starts_with("/_bifrost/")
+fn client_process_resolution_mode(
+    routes_to_admin: bool,
+    method: &Method,
+    tls_intercept_config: Option<&TlsInterceptConfig>,
+) -> ClientProcessResolutionMode {
+    if routes_to_admin {
+        ClientProcessResolutionMode::SkipAdmin
+    } else if method == Method::CONNECT
+        && tls_intercept_config.is_some_and(requires_client_app_for_tls_decision)
+    {
+        ClientProcessResolutionMode::SyncAppPolicy
+    } else {
+        ClientProcessResolutionMode::Normal
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -699,11 +718,13 @@ impl ProxyServer {
 
     pub fn with_admin_state(mut self, admin_state: AdminState) -> Self {
         let admin_state = admin_state.with_access_control(Arc::clone(&self.access_control));
+        admin_state.set_process_resolver_diagnostics(PROCESS_RESOLVER.diagnostics());
         self.admin_state = Some(Arc::new(admin_state));
         self
     }
 
     pub fn with_admin_state_shared(mut self, admin_state: Arc<AdminState>) -> Self {
+        admin_state.set_process_resolver_diagnostics(PROCESS_RESOLVER.diagnostics());
         self.admin_state = Some(admin_state);
         self
     }
@@ -1172,8 +1193,7 @@ async fn handle_http_connection(
         }
     };
     let io = TokioIo::new(stream);
-    let client_process_cache = Arc::new(Mutex::new(None::<ClientProcess>));
-    let client_process_resolution_started = Arc::new(AtomicBool::new(false));
+    let client_process_state = Arc::new(ConnectionProcessState::default());
 
     let http1_max_header_size = if let Some(ref state) = admin_state {
         if let Some(ref config_manager) = state.config_manager {
@@ -1194,8 +1214,7 @@ async fn handle_http_connection(
         let admin_security_config = admin_security_config.clone();
         let dns_resolver = Arc::clone(&dns_resolver);
         let access_control = Arc::clone(&access_control);
-        let client_process_cache = Arc::clone(&client_process_cache);
-        let client_process_resolution_started = Arc::clone(&client_process_resolution_started);
+        let client_process_state = Arc::clone(&client_process_state);
         let proxy_auth_rate_limiter = Arc::clone(&proxy_auth_rate_limiter);
         async move {
             handle_request(
@@ -1211,8 +1230,7 @@ async fn handle_http_connection(
                 dns_resolver,
                 access_control,
                 initial_generation,
-                client_process_cache,
-                client_process_resolution_started,
+                client_process_state,
                 proxy_auth_rate_limiter,
             )
             .await
@@ -1244,8 +1262,7 @@ async fn handle_request(
     dns_resolver: Arc<DnsResolver>,
     access_control: Arc<tokio::sync::RwLock<ClientAccessControl>>,
     initial_generation: u64,
-    client_process_cache: Arc<Mutex<Option<ClientProcess>>>,
-    client_process_resolution_started: Arc<AtomicBool>,
+    client_process_state: Arc<ConnectionProcessState>,
     proxy_auth_rate_limiter: Arc<ProxyAuthRateLimiter>,
 ) -> std::result::Result<Response<BoxBody>, hyper::Error> {
     let method = req.method().clone();
@@ -1253,9 +1270,7 @@ async fn handle_request(
     let path = uri.path();
     let verbose_logging = proxy_config.verbose_logging;
     let is_local_client = peer_addr.ip().is_loopback();
-    let is_admin_request = is_admin_request_path(path);
-    let can_defer_client_process =
-        !is_admin_request && should_defer_client_process_resolution(&method, verbose_logging);
+    let admin_routing = admin_routing_decision(&req, proxy_config.port, &proxy_config.host);
 
     let connect_tls_intercept_config = if method == Method::CONNECT {
         Some(if let Some(ref state) = admin_state {
@@ -1276,40 +1291,55 @@ async fn handle_request(
     } else {
         None
     };
-
+    let process_resolution_mode = client_process_resolution_mode(
+        admin_routing.routes_to_admin,
+        &method,
+        connect_tls_intercept_config.as_ref(),
+    );
     let mut ctx = RequestContext::new()
         .with_client_ip(peer_addr.ip().to_string())
         .with_port(proxy_config.port);
-    let cached_client_process = client_process_cache
-        .lock()
-        .ok()
-        .and_then(|cache| cache.clone());
+    let cached_client_process = if process_resolution_mode == ClientProcessResolutionMode::SkipAdmin
+    {
+        None
+    } else {
+        client_process_state.cached()
+    };
 
-    let client_process = if let Some(client_process) = cached_client_process {
+    let client_process = if process_resolution_mode == ClientProcessResolutionMode::SkipAdmin {
+        None
+    } else if let Some(client_process) = cached_client_process {
         Some(client_process)
-    } else if let Some(ref tls_intercept_config) = connect_tls_intercept_config {
-        let client_process =
-            if is_local_client && requires_client_app_for_tls_decision(tls_intercept_config) {
-                let (max_retries, delay_ms) = app_policy_process_resolution_retry_config();
-                debug!(
-                    req_id = ctx.id_str(),
-                    peer_addr = %peer_addr,
-                    local_addr = %local_addr,
-                    max_retries,
-                    delay_ms,
-                    "CONNECT request requires synchronous client process resolution for app policy"
-                );
-                resolve_client_process_async_for_connection_with_retry(
-                    &peer_addr,
-                    &local_addr,
-                    max_retries,
-                    delay_ms,
-                )
-                .await
-            } else {
-                resolve_client_process_async_for_connection(&peer_addr, &local_addr).await
-            };
-        if is_local_client && requires_client_app_for_tls_decision(tls_intercept_config) {
+    } else if connect_tls_intercept_config.is_some() {
+        let client_process = client_process_state
+            .resolve(|| async {
+                if is_local_client
+                    && process_resolution_mode == ClientProcessResolutionMode::SyncAppPolicy
+                {
+                    let (max_retries, delay_ms) = app_policy_process_resolution_retry_config();
+                    debug!(
+                        req_id = ctx.id_str(),
+                        peer_addr = %peer_addr,
+                        local_addr = %local_addr,
+                        max_retries,
+                        delay_ms,
+                        "CONNECT request requires synchronous client process resolution for app policy"
+                    );
+                    resolve_client_process_async_for_connection_with_retry_shared(
+                        &peer_addr,
+                        &local_addr,
+                        max_retries,
+                        delay_ms,
+                    )
+                    .await
+                } else {
+                    resolve_client_process_async_for_connection_shared(&peer_addr, &local_addr)
+                        .await
+                }
+            })
+            .await;
+        if is_local_client && process_resolution_mode == ClientProcessResolutionMode::SyncAppPolicy
+        {
             match client_process.as_ref() {
                 Some(process) => debug!(
                     req_id = ctx.id_str(),
@@ -1327,83 +1357,46 @@ async fn handle_request(
                 ),
             }
         }
-        if let Some(ref client_process) = client_process {
-            if let Ok(mut cache) = client_process_cache.lock() {
-                *cache = Some(client_process.clone());
-            }
-        }
         client_process
-    } else if can_defer_client_process {
-        if let Some(state) = admin_state.clone() {
-            let should_spawn = !client_process_resolution_started.swap(true, Ordering::AcqRel);
-            if should_spawn {
-                let record_id = ctx.id_str();
-                let client_process_cache = Arc::clone(&client_process_cache);
-                let resolution_started_for_finish = Arc::clone(&client_process_resolution_started);
-                spawn_async_process_resolver_with_finish(
-                    peer_addr,
-                    local_addr,
-                    record_id.to_string(),
-                    move |id, process| {
-                        if let Ok(mut cache) = client_process_cache.lock() {
-                            *cache = Some(process.clone());
-                        }
-                        state.update_client_process(&id, process.name, process.pid, process.path);
-                    },
-                    move || {
-                        resolution_started_for_finish.store(false, Ordering::Release);
-                    },
-                );
-            }
-        }
-        None
     } else {
-        let client_process =
-            resolve_client_process_async_for_connection(&peer_addr, &local_addr).await;
-        if let Some(ref client_process) = client_process {
-            if let Ok(mut cache) = client_process_cache.lock() {
-                *cache = Some(client_process.clone());
-            }
-        }
+        let client_process = client_process_state
+            .resolve(|| async {
+                resolve_client_process_async_for_connection_shared(&peer_addr, &local_addr).await
+            })
+            .await;
         let client_process = if client_process.is_some() {
             client_process
         } else if is_local_client {
             let mut resolved = None;
             for _ in 0..20 {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                if let Ok(guard) = client_process_cache.lock() {
-                    if guard.is_some() {
-                        resolved = guard.clone();
-                        break;
-                    }
+                if let Some(process) = client_process_state.cached() {
+                    resolved = Some(process);
+                    break;
                 }
             }
             if resolved.is_none() {
                 if let Some(state) = admin_state.clone() {
-                    let should_spawn =
-                        !client_process_resolution_started.swap(true, Ordering::AcqRel);
+                    let should_spawn = client_process_state.try_start_background_resolution();
                     if should_spawn {
                         let record_id = ctx.id_str();
-                        let client_process_cache = Arc::clone(&client_process_cache);
-                        let resolution_started_for_finish =
-                            Arc::clone(&client_process_resolution_started);
+                        let state_for_success = Arc::clone(&client_process_state);
+                        let state_for_finish = Arc::clone(&client_process_state);
                         spawn_async_process_resolver_with_finish(
                             peer_addr,
                             local_addr,
                             record_id.to_string(),
                             move |id, process| {
-                                if let Ok(mut cache) = client_process_cache.lock() {
-                                    *cache = Some(process.clone());
-                                }
+                                let process = state_for_success.store(Arc::new(process));
                                 state.update_client_process(
                                     &id,
-                                    process.name,
+                                    process.name.clone(),
                                     process.pid,
-                                    process.path,
+                                    process.path.clone(),
                                 );
                             },
                             move || {
-                                resolution_started_for_finish.store(false, Ordering::Release);
+                                state_for_finish.finish_background_resolution();
                             },
                         );
                     }
@@ -1516,9 +1509,8 @@ async fn handle_request(
         }
     }
 
-    let is_admin_virtual_host = is_admin_virtual_host_request(&req);
-    let is_proxy_request_to_other_server =
-        is_proxy_request_to_other_for_admin_routing(&req, proxy_config.port, &proxy_config.host);
+    let is_admin_virtual_host = admin_routing.is_admin_virtual_host;
+    let is_proxy_request_to_other_server = admin_routing.is_proxy_request_to_other_server;
 
     if is_devtools_bridge_admin_path(path) {
         if let Some(state) = admin_state {
@@ -1691,6 +1683,7 @@ async fn handle_request(
             admin_state.clone(),
             Some(dns_resolver),
             push_manager.clone(),
+            Arc::clone(&client_process_state),
         )
         .await
         {
@@ -2001,6 +1994,33 @@ fn is_admin_virtual_host_request<B>(req: &Request<B>) -> bool {
     false
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AdminRoutingDecision {
+    is_admin_virtual_host: bool,
+    is_proxy_request_to_other_server: bool,
+    routes_to_admin: bool,
+}
+
+fn admin_routing_decision<B>(
+    req: &Request<B>,
+    self_port: u16,
+    self_host: &str,
+) -> AdminRoutingDecision {
+    let is_admin_virtual_host = is_admin_virtual_host_request(req);
+    let is_proxy_request_to_other_server =
+        is_proxy_request_to_other_for_admin_routing(req, self_port, self_host);
+    let path = req.uri().path();
+    let routes_to_admin = is_devtools_bridge_admin_path(path)
+        || (!is_proxy_request_to_other_server
+            && (path.starts_with(ADMIN_PATH_PREFIX) || is_admin_virtual_host));
+
+    AdminRoutingDecision {
+        is_admin_virtual_host,
+        is_proxy_request_to_other_server,
+        routes_to_admin,
+    }
+}
+
 fn is_proxy_request_to_other_for_admin_routing<B>(
     req: &Request<B>,
     self_port: u16,
@@ -2140,11 +2160,7 @@ fn rewrite_virtual_host_request(req: Request<Incoming>) -> Request<Incoming> {
     Request::from_parts(parts, body)
 }
 
-fn is_direct_browser_access(
-    req: &Request<Incoming>,
-    config: &ProxyConfig,
-    allow_remote: bool,
-) -> bool {
+fn is_direct_browser_access<B>(req: &Request<B>, config: &ProxyConfig, allow_remote: bool) -> bool {
     let uri = req.uri();
     let path = uri.path();
 
@@ -2199,6 +2215,26 @@ fn convert_admin_response(
 mod tests {
     use super::*;
     use bifrost_tls::{generate_root_ca, init_crypto_provider, DynamicCertGenerator, SniResolver};
+    use hyper::header::{CONTENT_TYPE, LOCATION};
+    use hyper::StatusCode;
+
+    #[derive(Clone)]
+    struct StaticStatusRules;
+
+    impl RulesResolver for StaticStatusRules {
+        fn resolve_with_context(
+            &self,
+            _url: &str,
+            _method: &str,
+            _req_headers: &HashMap<String, String>,
+            _req_cookies: &HashMap<String, String>,
+        ) -> ResolvedRules {
+            ResolvedRules {
+                status_code: Some(204),
+                ..Default::default()
+            }
+        }
+    }
 
     #[test]
     fn test_incomplete_message_is_treated_as_noisy_connection_close() {
@@ -2320,29 +2356,192 @@ mod tests {
     }
 
     #[test]
-    fn test_should_not_defer_client_process_for_connect() {
-        assert!(!should_defer_client_process_resolution(
-            &Method::CONNECT,
-            false
-        ));
+    fn test_client_process_resolution_mode_uses_admin_routing_decision() {
+        assert_eq!(
+            client_process_resolution_mode(true, &Method::GET, None),
+            ClientProcessResolutionMode::SkipAdmin
+        );
+        assert_eq!(
+            client_process_resolution_mode(false, &Method::GET, None),
+            ClientProcessResolutionMode::Normal
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_process_state_shares_one_successful_resolution() {
+        let state = Arc::new(ConnectionProcessState::default());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(12));
+        let tasks = (0..12)
+            .map(|_| {
+                let state = Arc::clone(&state);
+                let calls = Arc::clone(&calls);
+                let barrier = Arc::clone(&barrier);
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    state
+                        .resolve(|| async {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            Some(Arc::new(ClientProcess {
+                                pid: 42,
+                                name: "SharedBrowser".to_string(),
+                                path: Some("/Applications/SharedBrowser.app".to_string()),
+                            }))
+                        })
+                        .await
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for task in tasks {
+            assert_eq!(task.await.unwrap().unwrap().pid, 42);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.cached().unwrap().name, "SharedBrowser");
+    }
+
+    #[tokio::test]
+    async fn connection_process_state_does_not_cache_unknown() {
+        let state = ConnectionProcessState::default();
+        assert!(state.resolve(|| async { None }).await.is_none());
+        let resolved = state
+            .resolve(|| async {
+                Some(Arc::new(ClientProcess {
+                    pid: 84,
+                    name: "LateBrowser".to_string(),
+                    path: None,
+                }))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resolved.pid, 84);
+        assert_eq!(state.cached().unwrap().pid, 84);
+    }
+
+    #[tokio::test]
+    async fn connection_process_state_uses_background_result_without_reinitializing() {
+        let state = ConnectionProcessState::default();
+        state.store(Arc::new(ClientProcess {
+            pid: 126,
+            name: "BackgroundBrowser".to_string(),
+            path: None,
+        }));
+
+        let resolved = state
+            .resolve(|| async { panic!("cached background result must bypass resolver") })
+            .await
+            .unwrap();
+        assert_eq!(resolved.pid, 126);
+    }
+
+    #[tokio::test]
+    async fn connection_process_state_waits_for_inflight_background_resolution() {
+        let state = Arc::new(ConnectionProcessState::default());
+        assert!(state.try_start_background_resolution());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state_for_waiter = Arc::clone(&state);
+        let calls_for_waiter = Arc::clone(&calls);
+        let waiter = tokio::spawn(async move {
+            state_for_waiter
+                .resolve(|| async move {
+                    calls_for_waiter.fetch_add(1, Ordering::SeqCst);
+                    None
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        state.store(Arc::new(ClientProcess {
+            pid: 168,
+            name: "BackgroundWinner".to_string(),
+            path: None,
+        }));
+        state.finish_background_resolution();
+
+        assert_eq!(waiter.await.unwrap().unwrap().pid, 168);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn connection_process_state_releases_inflight_after_cancellation() {
+        let state = Arc::new(ConnectionProcessState::default());
+        let state_for_cancelled = Arc::clone(&state);
+        let cancelled = tokio::spawn(async move {
+            state_for_cancelled
+                .resolve(|| async { std::future::pending::<Option<Arc<ClientProcess>>>().await })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancelled.abort();
+        let _ = cancelled.await;
+
+        let resolved = state
+            .resolve(|| async {
+                Some(Arc::new(ClientProcess {
+                    pid: 210,
+                    name: "RecoveredBrowser".to_string(),
+                    path: None,
+                }))
+            })
+            .await
+            .unwrap();
+        assert_eq!(resolved.pid, 210);
     }
 
     #[test]
-    fn test_should_not_defer_client_process_for_plain_http() {
-        assert!(!should_defer_client_process_resolution(&Method::GET, false));
+    fn test_client_process_resolution_mode_keeps_connect_app_policy_synchronous() {
+        let config = TlsInterceptConfig {
+            enable_tls_interception: false,
+            intercept_exclude: Vec::new(),
+            intercept_include: Vec::new(),
+            app_intercept_exclude: Vec::new(),
+            app_intercept_include: vec!["*Chrome*".to_string()],
+            ip_intercept_exclude: Vec::new(),
+            ip_intercept_include: Vec::new(),
+            unsafe_ssl: false,
+        };
+        assert_eq!(
+            client_process_resolution_mode(false, &Method::CONNECT, Some(&config)),
+            ClientProcessResolutionMode::SyncAppPolicy
+        );
+        assert_eq!(
+            client_process_resolution_mode(false, &Method::GET, Some(&config)),
+            ClientProcessResolutionMode::Normal
+        );
     }
 
     #[test]
-    fn test_should_not_defer_client_process_for_verbose_plain_http() {
-        assert!(!should_defer_client_process_resolution(&Method::GET, true));
-    }
+    fn test_admin_routing_decision_does_not_misclassify_external_admin_like_path() {
+        let external = Request::builder()
+            .method(Method::GET)
+            .uri("http://example.com/_bifrost/api/proxy/address")
+            .header("host", "example.com")
+            .body(())
+            .unwrap();
+        let external_decision = admin_routing_decision(&external, 9900, "127.0.0.1");
+        assert!(external_decision.is_proxy_request_to_other_server);
+        assert!(!external_decision.routes_to_admin);
 
-    #[test]
-    fn test_is_admin_request_path() {
-        assert!(is_admin_request_path("/_bifrost"));
-        assert!(is_admin_request_path("/_bifrost/api/traffic"));
-        assert!(!is_admin_request_path("/api/_bifrost"));
-        assert!(!is_admin_request_path("/_bifrostish/api"));
+        let local = Request::builder()
+            .method(Method::GET)
+            .uri("/_bifrost/api/proxy/address")
+            .header("host", "127.0.0.1:9900")
+            .body(())
+            .unwrap();
+        assert!(admin_routing_decision(&local, 9900, "127.0.0.1").routes_to_admin);
+
+        let virtual_host = Request::builder()
+            .method(Method::GET)
+            .uri("http://bifrost.local/settings")
+            .header("host", "bifrost.local")
+            .body(())
+            .unwrap();
+        let virtual_host_decision = admin_routing_decision(&virtual_host, 9900, "127.0.0.1");
+        assert!(virtual_host_decision.is_admin_virtual_host);
+        assert!(virtual_host_decision.routes_to_admin);
     }
 
     #[test]
@@ -2576,5 +2775,390 @@ mod tests {
 
         assert!(Arc::ptr_eq(&config1, &config2));
         assert_eq!(config1.alpn_protocols, alpn);
+    }
+
+    #[test]
+    fn udp_fallback_detection_covers_io_network_and_unrelated_errors() {
+        assert!(is_udp_relay_fallback_bind_error(&BifrostError::Io(
+            std::io::Error::new(std::io::ErrorKind::AddrInUse, "busy")
+        )));
+        for message in [
+            "Address already in use",
+            "AddrInUse",
+            "bind failed: os error 48",
+            "bind failed: os error 98",
+            "bind failed: os error 10013",
+            "Only one usage of each socket address is normally permitted",
+        ] {
+            assert!(is_udp_relay_fallback_bind_error(&BifrostError::Network(
+                message.to_string()
+            )));
+        }
+        assert!(!is_udp_relay_fallback_bind_error(&BifrostError::Network(
+            "connection refused".to_string()
+        )));
+        assert!(!is_udp_relay_fallback_bind_error(&BifrostError::Parse(
+            "bad config".to_string()
+        )));
+    }
+
+    #[test]
+    fn response_cookie_serialization_escapes_and_emits_all_attributes() {
+        let cookie = ResCookieValue {
+            value: "quoted,semi;slash\\unicode-雪".to_string(),
+            max_age: Some(60),
+            path: Some("/api".to_string()),
+            domain: Some("example.test".to_string()),
+            secure: true,
+            http_only: true,
+            same_site: Some("Strict".to_string()),
+        };
+        let serialized = cookie.to_set_cookie_string("bad name");
+        assert!(serialized.starts_with("bad%20name="));
+        assert!(serialized.contains("%2C"));
+        assert!(serialized.contains("%3B"));
+        assert!(serialized.contains("%5C"));
+        assert!(serialized.contains("Max-Age=60"));
+        assert!(serialized.contains("Expires="));
+        assert!(serialized.contains("Path=/api"));
+        assert!(serialized.contains("Domain=example.test"));
+        assert!(serialized.contains("Secure"));
+        assert!(serialized.contains("HttpOnly"));
+        assert!(serialized.contains("SameSite=Strict"));
+        assert_eq!(cookie.to_string(), cookie.value);
+
+        let simple = ResCookieValue::simple("value".to_string());
+        assert_eq!(simple.to_set_cookie_string("name"), "name=value");
+    }
+
+    #[test]
+    fn direct_browser_access_covers_host_port_path_scheme_remote_and_accept_matrix() {
+        let config = ProxyConfig {
+            host: "127.0.0.1".to_string(),
+            port: 9900,
+            ..ProxyConfig::default()
+        };
+        let make = |uri: &str, host: Option<&str>, accept: Option<&str>| {
+            let mut builder = Request::builder().uri(uri);
+            if let Some(host) = host {
+                builder = builder.header(HOST, host);
+            }
+            if let Some(accept) = accept {
+                builder = builder.header("accept", accept);
+            }
+            builder.body(()).unwrap()
+        };
+        assert!(is_direct_browser_access(
+            &make("/", Some("127.0.0.1:9900"), Some("text/html,*/*")),
+            &config,
+            false
+        ));
+        assert!(is_direct_browser_access(
+            &make("/", Some("remote.test:9900"), Some("text/html")),
+            &config,
+            true
+        ));
+        assert!(!is_direct_browser_access(
+            &make("/other", Some("127.0.0.1:9900"), Some("text/html")),
+            &config,
+            false
+        ));
+        assert!(!is_direct_browser_access(
+            &make(
+                "http://127.0.0.1:9900/",
+                Some("127.0.0.1:9900"),
+                Some("text/html")
+            ),
+            &config,
+            false
+        ));
+        assert!(!is_direct_browser_access(
+            &make("/", None, Some("text/html")),
+            &config,
+            false
+        ));
+        assert!(!is_direct_browser_access(
+            &make("/", Some("remote.test:9900"), Some("text/html")),
+            &config,
+            false
+        ));
+        assert!(!is_direct_browser_access(
+            &make("/", Some("127.0.0.1:8800"), Some("text/html")),
+            &config,
+            false
+        ));
+        assert!(!is_direct_browser_access(
+            &make("/", Some("127.0.0.1:9900"), Some("application/json")),
+            &config,
+            false
+        ));
+    }
+
+    #[test]
+    fn proxy_target_routing_covers_self_loopback_wildcard_and_remote_hosts() {
+        let request = |uri: &str| Request::builder().uri(uri).body(()).unwrap();
+        assert!(!is_proxy_request_targeting_other(
+            &request("/relative"),
+            9900,
+            "127.0.0.1"
+        ));
+        assert!(is_proxy_request_targeting_other(
+            &request("http://example.test:8800/"),
+            9900,
+            "127.0.0.1"
+        ));
+        assert!(!is_proxy_request_targeting_other(
+            &request("http://127.0.0.1:9900/"),
+            9900,
+            "0.0.0.0"
+        ));
+        assert!(!is_proxy_request_targeting_other(
+            &request("http://example.test:9900/"),
+            9900,
+            "0.0.0.0"
+        ));
+        assert!(is_proxy_request_targeting_other(
+            &request("http://example.test:9900/"),
+            9900,
+            "proxy.test"
+        ));
+    }
+
+    #[tokio::test]
+    async fn trust_probe_bypass_and_response_helpers_cover_all_status_paths() {
+        use http_body_util::BodyExt;
+
+        let options = trust_probe_proxy_bypass_required_response(&Method::OPTIONS);
+        assert_eq!(options.status(), StatusCode::NO_CONTENT);
+        assert_eq!(options.headers()["access-control-allow-origin"], "*");
+        assert!(options
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty());
+
+        let get = trust_probe_proxy_bypass_required_response(&Method::GET);
+        assert_eq!(get.status(), StatusCode::CONFLICT);
+        assert_eq!(get.headers()[CONTENT_TYPE], "application/json");
+        let body = get.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains("trust_probe_must_bypass_proxy"));
+
+        let redirect = redirect_response("https://example.test/next");
+        assert_eq!(redirect.status(), StatusCode::FOUND);
+        assert_eq!(redirect.headers()[LOCATION], "https://example.test/next");
+
+        let required = proxy_auth_required_response();
+        assert_eq!(required.status(), StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+        assert!(required.headers().contains_key("proxy-authenticate"));
+        let banned = proxy_auth_banned_response();
+        assert_eq!(banned.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(banned.headers()["retry-after"], "300");
+    }
+
+    #[test]
+    fn tls_config_without_resolver_or_generator_returns_explicit_error() {
+        let error = TlsConfig::default()
+            .resolve_server_config("example.test", &[b"h2".to_vec()])
+            .unwrap_err();
+        assert!(error.to_string().contains("cert generator not configured"));
+    }
+
+    #[test]
+    fn proxy_server_builder_accessors_cover_optional_state() {
+        let state = AdminState::new(19900);
+        let access = Arc::new(RwLock::new(ClientAccessControl::new(
+            AccessControlConfig::default(),
+        )));
+        let server = ProxyServer::new(ProxyConfig::default())
+            .with_access_control(access.clone())
+            .with_admin_state(state)
+            .with_tls_config(Arc::new(TlsConfig::default()))
+            .with_rules(Arc::new(NoOpRulesResolver));
+        assert!(server.admin_state().is_some());
+        assert!(Arc::ptr_eq(server.access_control(), &access));
+        assert!(server.push_manager().is_none());
+    }
+
+    #[test]
+    fn coverage_90_debug_fd_limit_and_noop_values_helpers() {
+        let replacement = RegexReplace {
+            pattern: Regex::new("old.+").unwrap(),
+            replacement: "new".to_string(),
+            global: true,
+        };
+        let debug = format!("{replacement:?}");
+        assert!(debug.contains("old.+"));
+        assert!(debug.contains("replacement"));
+        assert!(debug.contains("global: true"));
+
+        #[cfg(unix)]
+        {
+            assert!(is_fd_limit_error(&std::io::Error::from_raw_os_error(
+                libc::EMFILE
+            )));
+            assert!(is_fd_limit_error(&std::io::Error::from_raw_os_error(
+                libc::ENFILE
+            )));
+            assert!(!is_fd_limit_error(&std::io::Error::from_raw_os_error(
+                libc::EINVAL
+            )));
+        }
+        let resolver = NoOpRulesResolver;
+        assert!(RulesResolver::values(&resolver).is_empty());
+    }
+
+    #[tokio::test]
+    async fn coverage_90_real_http_connection_spawns_deferred_process_resolution() {
+        use http_body_util::{BodyExt, Full};
+        use hyper::client::conn::http1 as client_http1;
+        use hyper::server::conn::http1 as server_http1;
+        use hyper::service::service_fn;
+        use hyper_util::rt::TokioIo;
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let peer: SocketAddr = "127.0.0.1:54340".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:19920".parse().unwrap();
+        let access = Arc::new(RwLock::new(ClientAccessControl::new(
+            AccessControlConfig::default(),
+        )));
+        let initial_generation = access.read().await.generation();
+        let service_access = Arc::clone(&access);
+        let service = service_fn(move |request: Request<Incoming>| {
+            let access = Arc::clone(&service_access);
+            async move {
+                handle_request(
+                    request,
+                    peer,
+                    local,
+                    Arc::new(StaticStatusRules),
+                    Arc::new(TlsConfig::default()),
+                    ProxyConfig {
+                        port: 19920,
+                        ..Default::default()
+                    },
+                    Some(Arc::new(AdminState::new(19920))),
+                    None,
+                    AdminSecurityConfig::new(19920),
+                    Arc::new(DnsResolver::new(false)),
+                    access,
+                    initial_generation,
+                    Arc::new(ConnectionProcessState::default()),
+                    Arc::new(ProxyAuthRateLimiter::new()),
+                )
+                .await
+            }
+        });
+        tokio::spawn(async move {
+            server_http1::Builder::new()
+                .serve_connection(TokioIo::new(server_io), service)
+                .await
+                .unwrap();
+        });
+        let (mut sender, connection) = client_http1::handshake(TokioIo::new(client_io))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let response = sender
+            .send_request(
+                Request::builder()
+                    .uri("http://coverage.test/deferred-process")
+                    .header(hyper::header::HOST, "coverage.test")
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty());
+
+        for (uri, host) in [
+            ("/login.html", "127.0.0.1:19920"),
+            ("http://bifrost.local/", "bifrost.local"),
+        ] {
+            let response = sender
+                .send_request(
+                    Request::builder()
+                        .uri(uri)
+                        .header(hyper::header::HOST, host)
+                        .body(Full::new(Bytes::new()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let _ = response.into_body().collect().await.unwrap();
+        }
+
+        let (remote_client_io, remote_server_io) = tokio::io::duplex(64 * 1024);
+        let remote_peer: SocketAddr = "192.0.2.44:54341".parse().unwrap();
+        let remote_access = Arc::new(RwLock::new(ClientAccessControl::new(
+            AccessControlConfig::default(),
+        )));
+        let remote_generation = remote_access.read().await.generation();
+        let service_access = Arc::clone(&remote_access);
+        let remote_service = service_fn(move |request: Request<Incoming>| {
+            let access = Arc::clone(&service_access);
+            async move {
+                handle_request(
+                    request,
+                    remote_peer,
+                    local,
+                    Arc::new(StaticStatusRules),
+                    Arc::new(TlsConfig::default()),
+                    ProxyConfig {
+                        port: 19920,
+                        ..Default::default()
+                    },
+                    Some(Arc::new(AdminState::new(19920))),
+                    None,
+                    AdminSecurityConfig::new(19920),
+                    Arc::new(DnsResolver::new(false)),
+                    access,
+                    remote_generation,
+                    Arc::new(ConnectionProcessState::default()),
+                    Arc::new(ProxyAuthRateLimiter::new()),
+                )
+                .await
+            }
+        });
+        tokio::spawn(async move {
+            server_http1::Builder::new()
+                .serve_connection(TokioIo::new(remote_server_io), remote_service)
+                .await
+                .unwrap();
+        });
+        let (mut remote_sender, remote_connection) =
+            client_http1::handshake(TokioIo::new(remote_client_io))
+                .await
+                .unwrap();
+        tokio::spawn(async move {
+            let _ = remote_connection.await;
+        });
+        for (uri, host) in [
+            ("/login.html", "127.0.0.1:19920"),
+            ("http://bifrost.local/", "bifrost.local"),
+        ] {
+            let response = remote_sender
+                .send_request(
+                    Request::builder()
+                        .uri(uri)
+                        .header(hyper::header::HOST, host)
+                        .body(Full::new(Bytes::new()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let _ = response.into_body().collect().await.unwrap();
+        }
     }
 }

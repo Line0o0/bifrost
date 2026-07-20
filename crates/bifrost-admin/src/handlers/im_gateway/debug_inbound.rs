@@ -13,6 +13,19 @@ struct MockInboundRequest {
     message_id: Option<String>,
     #[serde(default)]
     event_id: Option<String>,
+    #[serde(default)]
+    reply_to: Option<MockInboundReplyReference>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MockInboundReplyReference {
+    #[serde(default)]
+    message_id: Option<String>,
+    #[serde(default)]
+    created_at_ms: Option<u64>,
+    #[serde(default)]
+    text: Option<String>,
 }
 
 pub(super) async fn handle_debug(
@@ -95,6 +108,13 @@ async fn handle_mock_inbound(
             text: body.text,
             mentions: Vec::new(),
             images: Vec::new(),
+            reply_to: body
+                .reply_to
+                .map(|reply| crate::im_gateway::types::ImMessageReference {
+                    message_id: reply.message_id,
+                    created_at_ms: reply.created_at_ms,
+                    text: reply.text,
+                }),
             raw_type: Some("text".to_string()),
         }),
         received_at: now_ms(),
@@ -149,8 +169,6 @@ fn ensure_mock_event_sink(
     let route_store = service.route_store.clone();
     let provider_store = service.provider_store.clone();
     let agent_config_store = service.agent_config_store.clone();
-    let agent_client = service.agent_client.clone();
-    let agent_tools = service.agent_tools.clone();
     let schedule_store = service.schedule_store.clone();
     let scheduler = service.scheduler.clone();
     let target_store = service.target_store.clone();
@@ -169,8 +187,6 @@ fn ensure_mock_event_sink(
             route_store,
             provider_store,
             agent_config_store,
-            agent_client,
-            agent_tools,
             schedule_store,
             scheduler,
             target_store,

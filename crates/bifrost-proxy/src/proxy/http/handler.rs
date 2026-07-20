@@ -1271,11 +1271,188 @@ pub fn build_error_body(status_code: u16, error_info: &ConnectionErrorInfo) -> B
     Bytes::from(build_error_body_text(status_code, error_info))
 }
 
+fn escape_html_text(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+pub(crate) fn format_connection_endpoint(host: &str, port: u16) -> String {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+fn request_endpoint(request_url: &str) -> Option<String> {
+    let url = Url::parse(request_url).ok()?;
+    Some(format_connection_endpoint(
+        url.host_str()?,
+        url.port_or_known_default()?,
+    ))
+}
+
+/// Returns true only when the request explicitly advertises an HTML-capable media range.
+/// A missing `Accept` header or the generic `*/*` range is intentionally treated as plain text.
+pub(crate) fn request_explicitly_accepts_html(headers: &HeaderMap) -> bool {
+    let mut best_html_quality: Option<(u8, f32)> = None;
+
+    for value in headers.get_all(hyper::header::ACCEPT) {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        for item in value.split(',') {
+            let mut segments = item.split(';');
+            let media_range = segments.next().unwrap_or("").trim().to_ascii_lowercase();
+            let mut quality = 1.0;
+            for (name, value) in segments.filter_map(|parameter| parameter.trim().split_once('=')) {
+                if name.trim().eq_ignore_ascii_case("q") {
+                    quality = value
+                        .trim()
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|quality| (0.0..=1.0).contains(quality))
+                        .unwrap_or(0.0);
+                    break;
+                }
+            }
+            let specificity = match media_range.as_str() {
+                "text/html" | "application/xhtml+xml" => 2,
+                "text/*" => 1,
+                _ => continue,
+            };
+            if best_html_quality
+                .map(|(best_specificity, best_quality)| {
+                    specificity > best_specificity
+                        || (specificity == best_specificity && quality > best_quality)
+                })
+                .unwrap_or(true)
+            {
+                best_html_quality = Some((specificity, quality));
+            }
+        }
+    }
+
+    best_html_quality
+        .map(|(_, quality)| quality > 0.0)
+        .unwrap_or(false)
+}
+
+pub(crate) fn build_connection_error_body(
+    status_code: u16,
+    error_info: &ConnectionErrorInfo,
+    badge_rules_json: Option<&str>,
+) -> (Bytes, &'static str) {
+    let hostname = gethostname::gethostname().to_string_lossy().to_string();
+    let date = chrono::Local::now()
+        .format("%m/%d/%Y, %I:%M:%S %p")
+        .to_string();
+    let text = build_error_body_text_at(status_code, error_info, &hostname, &date);
+    let Some(rules_json) = badge_rules_json else {
+        return (Bytes::from(text), "text/plain; charset=utf-8");
+    };
+
+    let status = escape_html_text(&status_code.to_string());
+    let error_type = escape_html_text(error_info.error_type);
+    let error_message = escape_html_text(&error_info.error_message);
+    let upstream_target = escape_html_text(&error_info.host);
+    let request_target = request_endpoint(&error_info.request_url)
+        .map(|endpoint| escape_html_text(&endpoint))
+        .unwrap_or_else(|| "Unknown".to_string());
+    let request_url = escape_html_text(&error_info.request_url);
+    let rules_url = serde_json::from_str::<serde_json::Value>(rules_json)
+        .ok()
+        .and_then(|value| value.get("admin_port")?.as_u64())
+        .map(|port| format!("http://127.0.0.1:{port}/_bifrost/rules"));
+    let rules_action = rules_url.map_or_else(
+        || "<span class=\"hint\">Hover the Bifrost badge in the lower-left corner to inspect active rules.</span>".to_string(),
+        |url| format!("<a class=\"button primary\" href=\"{}\">Open Bifrost rules</a>", escape_html_text(&url)),
+    );
+    let suggestion = connection_error_suggestion(error_info).map_or_else(String::new, |value| {
+        format!(
+            "<div class=\"notice\"><strong>Certificate hint</strong><span>{}</span></div>",
+            escape_html_text(value)
+        )
+    });
+
+    let html = format!(
+        concat!(
+            "<!doctype html><html><head><meta charset=\"utf-8\">",
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
+            "<title>{status} · Upstream unavailable · Bifrost</title>",
+            "<style>",
+            ":root{{color-scheme:light dark;--bg:#f4f7fb;--glow:#dceaff;--card:rgba(255,255,255,.92);--text:#172033;--muted:#637089;--line:#dde4ef;--soft:#f7f9fc;--accent:#2563eb;--accent2:#1d4ed8;--danger:#dc2626;--shadow:0 24px 70px rgba(44,62,96,.16)}}",
+            "*{{box-sizing:border-box}}html,body{{min-height:100%}}body{{margin:0;background:radial-gradient(circle at 50% 8%,var(--glow),transparent 40%),var(--bg);color:var(--text);font:14px/1.5 Inter,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif}}",
+            "main{{min-height:100vh;display:grid;place-items:center;padding:48px 24px 80px}}",
+            ".page{{width:min(760px,100%)}}.card{{overflow:hidden;border:1px solid var(--line);border-radius:24px;background:var(--card);box-shadow:var(--shadow);backdrop-filter:blur(12px)}}",
+            ".hero{{display:flex;gap:18px;align-items:flex-start;padding:30px 32px 24px;border-bottom:1px solid var(--line)}}",
+            ".icon{{display:grid;flex:0 0 48px;height:48px;place-items:center;border-radius:14px;background:#fee2e2;color:var(--danger);font-size:24px;font-weight:800}}",
+            ".eyebrow{{display:flex;align-items:center;gap:9px;margin:1px 0 7px;color:var(--muted);font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase}}",
+            ".status{{padding:2px 8px;border-radius:999px;background:#fee2e2;color:#b91c1c;letter-spacing:0}}h1{{margin:0 0 7px;font-size:26px;line-height:1.2;letter-spacing:-.025em}}",
+            ".summary{{margin:0;color:var(--muted);font-size:15px}}.content{{display:grid;gap:20px;padding:24px 32px 30px}}",
+            ".error{{padding:15px 17px;border:1px solid #fecaca;border-radius:14px;background:#fff7f7;color:#991b1b;overflow-wrap:anywhere}}.error code{{font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;opacity:.72}}",
+            ".details{{display:grid;grid-template-columns:110px minmax(0,1fr);margin:0;border:1px solid var(--line);border-radius:14px;background:var(--soft);overflow:hidden}}",
+            ".details dt,.details dd{{margin:0;padding:10px 14px;border-bottom:1px solid var(--line)}}.details dt{{color:var(--muted);font-weight:600}}.details dd{{overflow-wrap:anywhere;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}}.details :nth-last-child(-n+2){{border-bottom:0}}",
+            ".guide h2{{margin:0 0 10px;font-size:15px}}.guide ol{{display:grid;gap:7px;margin:0;padding-left:22px;color:var(--muted)}}.guide strong{{color:var(--text)}}",
+            ".notice{{display:flex;gap:6px;flex-direction:column;padding:13px 15px;border:1px solid #fde68a;border-radius:12px;background:#fffbeb;color:#92400e}}",
+            ".actions{{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding-top:2px}}.button{{display:inline-flex;align-items:center;justify-content:center;min-height:38px;padding:0 15px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--text);font-weight:650;text-decoration:none;cursor:pointer}}",
+            ".button.primary{{border-color:var(--accent);background:var(--accent);color:#fff}}.button.primary:hover{{background:var(--accent2)}}.hint{{color:var(--muted);font-size:13px}}",
+            "details{{border-top:1px solid var(--line);padding-top:14px}}summary{{cursor:pointer}}pre{{margin:12px 0 0;padding:13px;border-radius:10px;background:var(--soft);white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}}",
+            "@media(max-width:600px){{main{{place-items:start center;padding:20px 12px 76px}}.card{{border-radius:18px}}.hero{{padding:23px 20px 19px}}.content{{padding:20px}}.icon{{flex-basis:42px;height:42px}}h1{{font-size:22px}}.details{{grid-template-columns:82px minmax(0,1fr)}}}}",
+            "@media(prefers-color-scheme:dark){{:root{{--bg:#0d1320;--glow:#172d55;--card:rgba(20,28,43,.94);--text:#edf3ff;--muted:#9ba9bf;--line:#2a3548;--soft:#151e2d;--accent:#3b82f6;--accent2:#60a5fa;--shadow:0 28px 80px rgba(0,0,0,.38)}}.icon,.status{{background:#451a1a;color:#fca5a5}}.error{{border-color:#632626;background:#291719;color:#fecaca}}.notice{{border-color:#644d18;background:#292414;color:#fde68a}}}}",
+            "</style></head><body><main><section class=\"page\" aria-labelledby=\"error-title\"><article class=\"card\">",
+            "<header class=\"hero\"><div class=\"icon\" aria-hidden=\"true\">!</div><div><div class=\"eyebrow\"><span class=\"status\">{status}</span> Bifrost proxy</div><h1 id=\"error-title\">Unable to reach the upstream service</h1><p class=\"summary\">Bifrost received your request, but could not connect to its destination.</p></div></header>",
+            "<div class=\"content\"><div class=\"error\"><code>{error_type}</code><br>{error_message}</div>",
+            "<dl class=\"details\"><dt>Status</dt><dd>{status}</dd><dt>Request target</dt><dd>{request_target}</dd><dt>Upstream target</dt><dd>{upstream_target}</dd><dt>Time</dt><dd>{date}</dd><dt>Request URL</dt><dd>{request_url}</dd></dl>",
+            "<section class=\"guide\"><h2>What you can do</h2><ol><li>Check that the target service is running and reachable.</li><li>Confirm the matched Bifrost rule points to the correct host and port.</li><li>After fixing the upstream or rule, retry this request.</li></ol></section>",
+            "{suggestion}<div class=\"actions\">{rules_action}<button class=\"button\" type=\"button\" onclick=\"location.reload()\">Try again</button></div>",
+            "<details><summary class=\"hint\">Raw diagnostics</summary><pre>{diagnostics}</pre></details>",
+            "</div></article></section></main></body></html>"
+        ),
+        status = status,
+        error_type = error_type,
+        error_message = error_message,
+        request_target = request_target,
+        upstream_target = upstream_target,
+        date = date,
+        request_url = request_url,
+        suggestion = suggestion,
+        rules_action = rules_action,
+        diagnostics = escape_html_text(&text),
+    );
+    let (body, injected) = maybe_inject_bifrost_badge_html(Bytes::from(html), rules_json);
+    debug_assert!(
+        injected,
+        "Bifrost connection error HTML must accept badge injection"
+    );
+    (body, "text/html; charset=utf-8")
+}
+
 fn build_error_body_text(status_code: u16, error_info: &ConnectionErrorInfo) -> String {
     let hostname = gethostname::gethostname().to_string_lossy().to_string();
     let now = chrono::Local::now();
     let date_str = now.format("%m/%d/%Y, %I:%M:%S %p").to_string();
 
+    build_error_body_text_at(status_code, error_info, &hostname, &date_str)
+}
+
+fn build_error_body_text_at(
+    status_code: u16,
+    error_info: &ConnectionErrorInfo,
+    hostname: &str,
+    date_str: &str,
+) -> String {
     let mut body = format!(
         "Status: {}\nError: {}\nFrom: Bifrost@{}\nHost: {}\nDate: {}\nURL: {}",
         status_code,
@@ -1306,13 +1483,30 @@ pub fn build_connection_error_response(
     status_code: u16,
     error_info: &ConnectionErrorInfo,
 ) -> Response<BoxBody> {
-    let body = build_error_body_text(status_code, error_info);
+    build_connection_error_response_with_badge(status_code, error_info, None)
+}
 
+pub(crate) fn build_connection_error_response_with_badge(
+    status_code: u16,
+    error_info: &ConnectionErrorInfo,
+    badge_rules_json: Option<&str>,
+) -> Response<BoxBody> {
+    let (body, content_type) =
+        build_connection_error_body(status_code, error_info, badge_rules_json);
+    build_connection_error_response_from_body(status_code, error_info, body, content_type)
+}
+
+pub(crate) fn build_connection_error_response_from_body(
+    status_code: u16,
+    error_info: &ConnectionErrorInfo,
+    body: Bytes,
+    content_type: &'static str,
+) -> Response<BoxBody> {
     Response::builder()
         .status(hyper::StatusCode::from_u16(status_code).unwrap_or(hyper::StatusCode::BAD_GATEWAY))
-        .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(hyper::header::CONTENT_TYPE, content_type)
         .header("X-Bifrost-Error", error_info.error_type)
-        .body(full_body(body.into_bytes()))
+        .body(full_body(body))
         .unwrap()
 }
 
@@ -1321,17 +1515,44 @@ pub fn build_overridden_error_response(
     default_status: u16,
     error_info: &ConnectionErrorInfo,
 ) -> Response<BoxBody> {
+    build_overridden_error_response_with_badge(rules, default_status, error_info, None)
+}
+
+pub(crate) fn build_overridden_error_response_with_badge(
+    rules: &ResolvedRules,
+    default_status: u16,
+    error_info: &ConnectionErrorInfo,
+    badge_rules_json: Option<&str>,
+) -> Response<BoxBody> {
     let status_code = rules
         .status_code
         .or(rules.replace_status)
         .unwrap_or(default_status);
 
-    let body = if let Some(ref res_body) = rules.res_body {
-        res_body.clone()
+    let (body, default_content_type) = if let Some(ref res_body) = rules.res_body {
+        (res_body.clone(), None)
     } else {
-        Bytes::from(build_error_body_text(status_code, error_info))
+        let (body, content_type) =
+            build_connection_error_body(status_code, error_info, badge_rules_json);
+        (body, Some(content_type))
     };
 
+    build_overridden_error_response_from_body(
+        rules,
+        status_code,
+        error_info,
+        body,
+        default_content_type,
+    )
+}
+
+pub(crate) fn build_overridden_error_response_from_body(
+    rules: &ResolvedRules,
+    status_code: u16,
+    error_info: &ConnectionErrorInfo,
+    body: Bytes,
+    default_content_type: Option<&'static str>,
+) -> Response<BoxBody> {
     let mut response = Response::builder()
         .status(hyper::StatusCode::from_u16(status_code).unwrap_or(hyper::StatusCode::BAD_GATEWAY));
 
@@ -1344,8 +1565,8 @@ pub fn build_overridden_error_response(
         }
     }
 
-    if rules.res_body.is_none() {
-        response = response.header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8");
+    if let Some(content_type) = default_content_type {
+        response = response.header(hyper::header::CONTENT_TYPE, content_type);
         response = response.header("X-Bifrost-Error", error_info.error_type);
     }
 
@@ -1794,6 +2015,10 @@ pub async fn handle_http_request(
         return Ok(mock_response);
     }
 
+    // `ignored.all` deliberately skips the generic mock generator, but redirect
+    // rules still retain their historical terminal behavior. This also serves
+    // as the fallback when a relative redirect cannot be resolved against an
+    // unusual request URI.
     if let Some(ref redirect_url) = resolved_rules.redirect {
         let status = resolved_rules.redirect_status.unwrap_or(302);
         if verbose_logging {
@@ -1873,6 +2098,7 @@ pub async fn handle_http_request(
     }
 
     let (mut parts, body) = req.into_parts();
+    let accepts_html_error = request_explicitly_accepts_html(&parts.headers);
     let request_origin = parts
         .headers
         .get(hyper::header::ORIGIN)
@@ -2348,14 +2574,38 @@ pub async fn handle_http_request(
             _ => is_https,
         }
     };
+    let error_badge_rules_json = if inject_bifrost_badge && accepts_html_error {
+        Some(build_badge_rules_json(admin_state.as_deref(), ctx.port).await)
+    } else {
+        None
+    };
     let build_conn_error_and_record =
         |error_type: &'static str, error_msg: String, err_tls_ms: Option<u64>| {
             let error_info = ConnectionErrorInfo {
                 error_type,
                 error_message: error_msg.clone(),
-                host: host.clone(),
+                host: format_connection_endpoint(&host, port),
                 request_url: url.clone(),
             };
+            let response_status = if needs_response_override(&resolved_rules) {
+                resolved_rules
+                    .status_code
+                    .or(resolved_rules.replace_status)
+                    .unwrap_or(502)
+            } else {
+                502
+            };
+            let (response_body, default_content_type) =
+                if let Some(ref res_body) = resolved_rules.res_body {
+                    (res_body.clone(), None)
+                } else {
+                    let (body, content_type) = build_connection_error_body(
+                        response_status,
+                        &error_info,
+                        error_badge_rules_json.as_deref(),
+                    );
+                    (body, Some(content_type))
+                };
             let total_ms = start_time.elapsed().as_millis() as u64;
             if let Some(ref state) = admin_state {
                 let mut record = TrafficRecord::new(
@@ -2364,14 +2614,7 @@ pub async fn handle_http_request(
                     record_url.clone(),
                 );
                 attach_devtools_client_req_id(&mut record, &devtools_client_req_id);
-                record.status = if needs_response_override(&resolved_rules) {
-                    resolved_rules
-                        .status_code
-                        .or(resolved_rules.replace_status)
-                        .unwrap_or(502)
-                } else {
-                    502
-                };
+                record.status = response_status;
                 record.duration_ms = total_ms;
                 record.host = original_host.clone();
                 record.timing = Some(RequestTiming {
@@ -2426,15 +2669,6 @@ pub async fn handle_http_request(
                     )
                 };
 
-                let response_body = if needs_response_override(&resolved_rules) {
-                    if let Some(ref res_body) = resolved_rules.res_body {
-                        res_body.clone()
-                    } else {
-                        build_error_body(record.status, &error_info)
-                    }
-                } else {
-                    build_error_body(502, &error_info)
-                };
                 record.response_body_ref = if state.get_super_performance_mode() {
                     None
                 } else if let Some(ref body_store) = state.body_store {
@@ -2450,18 +2684,18 @@ pub async fn handle_http_request(
                         for (name, value) in &resolved_rules.res_headers {
                             res_header_pairs.push((name.clone(), value.clone()));
                         }
-                        if resolved_rules.res_body.is_none() {
-                            res_header_pairs.push((
-                                "content-type".to_string(),
-                                "text/plain; charset=utf-8".to_string(),
-                            ));
+                        if let Some(content_type) = default_content_type {
+                            res_header_pairs
+                                .push(("content-type".to_string(), content_type.to_string()));
                             res_header_pairs
                                 .push(("x-bifrost-error".to_string(), error_type.to_string()));
                         }
                     } else {
                         res_header_pairs.push((
                             "content-type".to_string(),
-                            "text/plain; charset=utf-8".to_string(),
+                            default_content_type
+                                .unwrap_or("text/plain; charset=utf-8")
+                                .to_string(),
                         ));
                         res_header_pairs
                             .push(("x-bifrost-error".to_string(), error_type.to_string()));
@@ -2489,9 +2723,20 @@ pub async fn handle_http_request(
                         error_type
                     );
                 }
-                build_overridden_error_response(&resolved_rules, 502, &error_info)
+                build_overridden_error_response_from_body(
+                    &resolved_rules,
+                    response_status,
+                    &error_info,
+                    response_body,
+                    default_content_type,
+                )
             } else {
-                build_connection_error_response(502, &error_info)
+                build_connection_error_response_from_body(
+                    502,
+                    &error_info,
+                    response_body,
+                    default_content_type.unwrap_or("text/plain; charset=utf-8"),
+                )
             }
         };
 
@@ -3653,7 +3898,10 @@ pub async fn handle_http_request(
     };
 
     if inject_bifrost_badge {
-        let badge_rules_json = build_badge_rules_json(admin_state.as_deref(), ctx.port).await;
+        let badge_rules_json = match error_badge_rules_json.as_ref() {
+            Some(rules_json) => rules_json.clone(),
+            None => build_badge_rules_json(admin_state.as_deref(), ctx.port).await,
+        };
         let final_res_content_type = get_content_type(&res_parts);
         if final_res_content_type.starts_with("text/html") {
             if let Some(content_encoding) = response_content_encoding(&res_parts) {
@@ -6100,6 +6348,164 @@ mod coverage_boost {
         assert!(overridden2.headers().get("X-Bifrost-Error").is_none());
     }
 
+    #[tokio::test]
+    async fn build_connection_error_response_with_badge_wraps_and_escapes_diagnostics() {
+        let info = ConnectionErrorInfo {
+            error_type: "REQUEST_FAILED",
+            error_message: "connect <script>alert(\"x\')</script> & failed".to_string(),
+            host: "<upstream.example>".to_string(),
+            request_url: "http://example.test/?q=<img>".to_string(),
+        };
+        let rules_json = r#"{"rules":[{"name":"active-rule","rule_count":1,"group_id":null,"group_name":null}],"merged_content":"example.test host://127.0.0.1:1","admin_port":18880}"#;
+
+        let response = build_connection_error_response_with_badge(502, &info, Some(rules_json));
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect error page")
+            .to_bytes();
+        let html = String::from_utf8(body.to_vec()).expect("utf-8 error page");
+
+        assert!(html.starts_with("<!doctype html>"));
+        assert!(html.contains("min-height:100vh;display:grid;place-items:center"));
+        assert!(html.contains("@media(prefers-color-scheme:dark)"));
+        assert!(html.contains("@media(max-width:600px)"));
+        assert!(html.contains("Unable to reach the upstream service"));
+        assert!(html.contains("What you can do"));
+        assert!(html.contains("Open Bifrost rules"));
+        assert!(html.contains("http://127.0.0.1:18880/_bifrost/rules"));
+        assert!(html.contains("Try again"));
+        assert!(html.contains("Raw diagnostics"));
+        assert!(html.contains("Status: 502"));
+        assert!(html.contains("<dt>Request target</dt><dd>example.test:80</dd>"));
+        assert!(html.contains("<dt>Upstream target</dt><dd>&lt;upstream.example&gt;</dd>"));
+        assert!(html.contains("Host: &lt;upstream.example&gt;"));
+        assert!(html.contains("q=&lt;img&gt;"));
+        assert!(
+            html.contains("connect &lt;script&gt;alert(&quot;x&#39;)&lt;/script&gt; &amp; failed")
+        );
+        assert!(!html.contains("Host: <upstream.example>"));
+        assert!(html.contains("__bifrost_badge__"));
+        assert!(html.contains("__bb_panel__"));
+        assert!(html.contains("active-rule"));
+        assert!(html.contains("Copy merged rules"));
+
+        let tls_info = ConnectionErrorInfo {
+            error_type: "REQUEST_TLS_FAILED",
+            error_message: "certificate verify failed".to_string(),
+            host: "tls.example".to_string(),
+            request_url: "https://tls.example/".to_string(),
+        };
+        let (hint_body, hint_content_type) =
+            build_connection_error_body(502, &tls_info, Some(r#"{"rules":[]}"#));
+        let hint_html = String::from_utf8(hint_body.to_vec()).expect("utf-8 hint page");
+        assert_eq!(hint_content_type, "text/html; charset=utf-8");
+        assert!(hint_html.contains("Certificate hint"));
+        assert!(hint_html.contains("upstreamUnsafeSsl://true"));
+        assert!(hint_html.contains("Hover the Bifrost badge"));
+
+        assert_eq!(
+            format_connection_endpoint("2001:db8::1", 8443),
+            "[2001:db8::1]:8443"
+        );
+        assert_eq!(
+            request_endpoint("https://example.test/path").as_deref(),
+            Some("example.test:443")
+        );
+        assert!(request_endpoint("not a URL").is_none());
+    }
+
+    #[test]
+    fn connection_error_html_requires_explicit_acceptable_media_range() {
+        let mut headers = HeaderMap::new();
+        assert!(!request_explicitly_accepts_html(&headers));
+
+        headers.insert(header::ACCEPT, HeaderValue::from_static("*/*"));
+        assert!(!request_explicitly_accepts_html(&headers));
+
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("application/json, text/plain;q=0.9"),
+        );
+        assert!(!request_explicitly_accepts_html(&headers));
+
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static(
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            ),
+        );
+        assert!(request_explicitly_accepts_html(&headers));
+
+        headers.insert(header::ACCEPT, HeaderValue::from_static("text/*;q=0.4"));
+        assert!(request_explicitly_accepts_html(&headers));
+
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/*;q=0.8, text/html;q=0"),
+        );
+        assert!(!request_explicitly_accepts_html(&headers));
+
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/html;q=0, text/html;q=0.7"),
+        );
+        assert!(request_explicitly_accepts_html(&headers));
+
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/html;q=invalid, */*"),
+        );
+        assert!(!request_explicitly_accepts_html(&headers));
+
+        headers.clear();
+        headers.append(
+            header::ACCEPT,
+            HeaderValue::from_bytes(b"\xff").expect("opaque header value"),
+        );
+        assert!(!request_explicitly_accepts_html(&headers));
+    }
+
+    #[tokio::test]
+    async fn overridden_connection_error_body_is_not_replaced_by_badge_page() {
+        let info = ConnectionErrorInfo {
+            error_type: "REQUEST_FAILED",
+            error_message: "connect failed".to_string(),
+            host: "upstream.example".to_string(),
+            request_url: "http://upstream.example/".to_string(),
+        };
+        let rules = ResolvedRules {
+            replace_status: Some(503),
+            res_body: Some(Bytes::from_static(b"custom error body")),
+            ..Default::default()
+        };
+
+        let response = build_overridden_error_response_with_badge(
+            &rules,
+            502,
+            &info,
+            Some(r#"{"rules":[],"merged_content":"","admin_port":18880}"#),
+        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().get("X-Bifrost-Error").is_none());
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect custom error body")
+            .to_bytes();
+        assert_eq!(body, Bytes::from_static(b"custom error body"));
+        assert!(!body
+            .windows("__bifrost_badge__".len())
+            .any(|window| window == b"__bifrost_badge__"));
+    }
+
     #[test]
     fn metrics_only_forwarding_mode_disabled_for_websocket_and_sse() {
         // websocket / sse 一律不走 metrics-only 快速路径
@@ -7883,5 +8289,1241 @@ mod coverage_boost_v3 {
             let uri = build_proxy_forward_uri(&processed, "example.com", 443, true).unwrap();
             assert_eq!(uri, "https://example.com/secure".parse::<Uri>().unwrap());
         }
+    }
+}
+
+#[cfg(test)]
+mod coverage_90_wave {
+    use super::*;
+    use http_body_util::{Full, StreamBody};
+    use hyper::client::conn::http1 as client_http1;
+    use hyper::server::conn::http1 as server_http1;
+    use hyper::service::service_fn;
+    use hyper::{header, Method};
+    use hyper_util::rt::TokioIo;
+    use std::convert::Infallible;
+
+    #[derive(Clone)]
+    struct StaticResolver(ResolvedRules);
+
+    impl RulesResolver for StaticResolver {
+        fn resolve_with_context(
+            &self,
+            _url: &str,
+            _method: &str,
+            _req_headers: &HashMap<String, String>,
+            _req_cookies: &HashMap<String, String>,
+        ) -> ResolvedRules {
+            self.0.clone()
+        }
+    }
+
+    async fn run_full_request<B>(
+        rules: ResolvedRules,
+        admin_state: Option<Arc<AdminState>>,
+        request: Request<B>,
+        max_body_buffer_size: usize,
+        max_body_probe_size: usize,
+        verbose: bool,
+    ) -> Response<Incoming>
+    where
+        B: hyper::body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        run_full_request_config(
+            rules,
+            admin_state,
+            request,
+            max_body_buffer_size,
+            max_body_probe_size,
+            verbose,
+            false,
+        )
+        .await
+    }
+
+    async fn run_full_request_config<B>(
+        rules: ResolvedRules,
+        admin_state: Option<Arc<AdminState>>,
+        request: Request<B>,
+        max_body_buffer_size: usize,
+        max_body_probe_size: usize,
+        verbose: bool,
+        inject_badge: bool,
+    ) -> Response<Incoming>
+    where
+        B: hyper::body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (mut sender, client_conn) = client_http1::handshake(TokioIo::new(client_io))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = client_conn.await;
+        });
+
+        let resolver: Arc<dyn RulesResolver> = Arc::new(StaticResolver(rules));
+        let service = service_fn(move |request: Request<Incoming>| {
+            let resolver = resolver.clone();
+            let admin_state = admin_state.clone();
+            async move {
+                let mut ctx = RequestContext::new().with_request_info(
+                    request.uri().to_string(),
+                    request.method().to_string(),
+                    request.uri().host().unwrap_or_default().to_string(),
+                    request.uri().path().to_string(),
+                    request.uri().query().unwrap_or_default().to_string(),
+                    "127.0.0.1".to_string(),
+                );
+                ctx.id_string = "REQ-handler-coverage".to_string();
+                let response = handle_http_request(
+                    request,
+                    resolver,
+                    verbose,
+                    false,
+                    max_body_buffer_size,
+                    max_body_probe_size,
+                    inject_badge,
+                    &ctx,
+                    admin_state,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    Response::builder()
+                        .status(StatusCode::BAD_GATEWAY)
+                        .body(full_body(error.to_string()))
+                        .unwrap()
+                });
+                Ok::<_, Infallible>(response)
+            }
+        });
+        let server =
+            server_http1::Builder::new().serve_connection(TokioIo::new(server_io), service);
+        tokio::spawn(async move {
+            let _ = server.await;
+        });
+        sender.send_request(request).await.unwrap()
+    }
+
+    async fn response_body(response: Response<Incoming>) -> Bytes {
+        http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes()
+    }
+
+    fn breakpoint_rule(value: &str) -> crate::server::RuleValue {
+        crate::server::RuleValue {
+            pattern: "source.test".to_string(),
+            protocol: Protocol::Breakpoint,
+            value: value.to_string(),
+            options: HashMap::new(),
+            rule_name: Some("handler-coverage-breakpoint".to_string()),
+            raw: None,
+            line: None,
+            auto_tls_intercept: true,
+        }
+    }
+
+    async fn wait_for_breakpoint(state: &AdminState) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !state.breakpoint_manager.has_pending("REQ-handler-coverage") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("handler breakpoint should become pending");
+    }
+
+    async fn websocket_fixture(status: u16) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while request.len() < 16 * 1024 {
+                if stream.read_exact(&mut byte).await.is_err() {
+                    return;
+                }
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request_text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+            assert!(request_text.contains("x-handler-coverage: request"));
+            let response = if status == 101 {
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: handler-accept\r\nSec-WebSocket-Protocol: chat.v1\r\nSec-WebSocket-Extensions: permessage-deflate\r\nX-Upstream-Handler: yes\r\n\r\n"
+                    .to_string()
+            } else {
+                format!("HTTP/1.1 {status} Forbidden\r\nContent-Length: 0\r\n\r\n")
+            };
+            stream.write_all(response.as_bytes()).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        });
+        (address, task)
+    }
+
+    async fn chunked_http_fixture() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = service_fn(|request: Request<Incoming>| async move {
+                let request_body = request.into_body().collect().await.unwrap().to_bytes();
+                assert_eq!(request_body, Bytes::from_static(b"stream-new-body"));
+                let frames = futures_util::stream::iter(vec![
+                    Ok::<_, Infallible>(hyper::body::Frame::data(Bytes::from_static(b"chunked"))),
+                    Ok::<_, Infallible>(hyper::body::Frame::data(Bytes::from_static(b"-response"))),
+                ]);
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .header(header::CONTENT_TYPE, "text/plain")
+                        .body(StreamBody::new(frames))
+                        .unwrap(),
+                )
+            });
+            server_http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await
+                .unwrap();
+        });
+        (address, task)
+    }
+
+    fn handler_websocket_request() -> Request<Full<Bytes>> {
+        Request::builder()
+            .method(Method::GET)
+            .uri("http://source.test/socket?coverage=handler")
+            .header(header::HOST, "source.test")
+            .header(header::UPGRADE, "websocket")
+            .header(header::CONNECTION, "Upgrade")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-protocol", "chat.v1, other")
+            .header("sec-websocket-extensions", "permessage-deflate")
+            .header("origin", "http://source.test")
+            .header("cookie", "session=handler")
+            .body(Full::new(Bytes::new()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn redirect_and_location_with_admin_cover_mock_traffic_recording() {
+        let admin = Arc::new(AdminState::new(19090));
+        let redirect = ResolvedRules {
+            redirect: Some("https://redirect.test/next".to_string()),
+            redirect_status: Some(308),
+            ..Default::default()
+        };
+        let request = Request::builder()
+            .uri("http://source.test/redirect")
+            .header(header::HOST, "source.test")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let response =
+            run_full_request(redirect, Some(admin.clone()), request, 1024, 64, true).await;
+        assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+
+        let location = ResolvedRules {
+            location_href: Some("https://location.test/landing".to_string()),
+            ignored: crate::server::IgnoredFields {
+                all: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let request = Request::builder()
+            .uri("https://source.test/location")
+            .header(header::HOST, "source.test")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let response = run_full_request(location, Some(admin), request, 1024, 64, true).await;
+        assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+    }
+
+    #[tokio::test]
+    async fn direct_status_covers_request_body_rules_and_oversize_drain() {
+        let rules = ResolvedRules {
+            status_code: Some(209),
+            res_body: Some(Bytes::from_static(b"direct")),
+            req_prepend: Some(Bytes::from_static(b"prefix-")),
+            req_append: Some(Bytes::from_static(b"-suffix")),
+            req_replace: vec![("old".to_string(), "new".to_string())],
+            method: Some("PUT".to_string()),
+            req_headers: vec![("X-Request-Rule".to_string(), "applied".to_string())],
+            ..Default::default()
+        };
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("http://direct.test/body")
+            .header(header::HOST, "direct.test")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .header(header::CONTENT_LENGTH, "8")
+            .body(Full::new(Bytes::from_static(b"old-body")))
+            .unwrap();
+        let response = run_full_request(
+            rules.clone(),
+            Some(Arc::new(AdminState::new(19091))),
+            request,
+            1024,
+            64,
+            true,
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 209);
+        assert_eq!(response_body(response).await, Bytes::from_static(b"direct"));
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("http://direct.test/oversize")
+            .header(header::HOST, "direct.test")
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(header::CONTENT_LENGTH, "16")
+            .body(Full::new(Bytes::from_static(b"0123456789abcdef")))
+            .unwrap();
+        let response = run_full_request(rules, None, request, 4, 2, true).await;
+        assert_eq!(response.status().as_u16(), 209);
+    }
+
+    #[tokio::test]
+    async fn direct_status_covers_body_override_cookie_merge_and_empty_body() {
+        let rules = ResolvedRules {
+            status_code: Some(210),
+            req_body: Some(Bytes::from_static(b"replacement")),
+            req_cookies: vec![("added".to_string(), "cookie".to_string())],
+            ..Default::default()
+        };
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("http://direct.test/override")
+            .header(header::HOST, "direct.test")
+            .header(header::COOKIE, "a=1")
+            .header(header::COOKIE, "b=2")
+            .header(header::TRANSFER_ENCODING, "chunked")
+            .body(Full::new(Bytes::from_static(b"original")))
+            .unwrap();
+        let response = run_full_request(rules, None, request, 1024, 64, true).await;
+        assert_eq!(response.status().as_u16(), 210);
+
+        let rules = ResolvedRules {
+            status_code: Some(204),
+            ..Default::default()
+        };
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("http://direct.test/empty")
+            .header(header::HOST, "direct.test")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let response = run_full_request(rules, None, request, 1024, 64, false).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn handler_mock_file_rawfile_and_template_cover_recorded_immediate_responses() {
+        let admin = Arc::new(AdminState::new(19092));
+        let variants = [
+            ResolvedRules {
+                mock_file: Some("(inline handler file)".to_string()),
+                status_code: Some(211),
+                ..Default::default()
+            },
+            ResolvedRules {
+                mock_rawfile: Some(
+                    "(HTTP/1.1 212 Custom\\r\\nX-Raw: handler\\r\\n\\r\\nraw)".to_string(),
+                ),
+                ..Default::default()
+            },
+            ResolvedRules {
+                mock_template: Some("({{host}} {{path}} {{method}})".to_string()),
+                ..Default::default()
+            },
+        ];
+        for (index, rules) in variants.into_iter().enumerate() {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://mock.test/variant/{index}"))
+                .header(header::HOST, "mock.test")
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let response =
+                run_full_request(rules, Some(admin.clone()), request, 1024, 64, true).await;
+            assert!(response.status().is_success());
+            assert!(!response_body(response).await.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn plaintext_forward_executes_scripts_and_persists_with_full_admin_state() {
+        use bifrost_admin::ScriptManager;
+        use bifrost_script::ScriptType;
+
+        let harness = bifrost_admin::test_support::TestAdminState::builder()
+            .port(19093)
+            .build();
+        let manager = ScriptManager::new(harness.data_dir().join("handler-scripts"));
+        manager.init().await.unwrap();
+        manager
+            .engine()
+            .save_script(
+                ScriptType::Request,
+                "handler-request",
+                r#"request.method = "PATCH"; request.body = "handler-script-request";"#,
+            )
+            .await
+            .unwrap();
+        manager
+            .engine()
+            .save_script(
+                ScriptType::Response,
+                "handler-response",
+                r#"response.status = 208; response.headers["content-type"] = "text/event-stream"; response.body = ["data: handler-script-response", "", "data: [DONE]", "", ""].join(String.fromCharCode(10));"#,
+            )
+            .await
+            .unwrap();
+        manager
+            .engine()
+            .save_script(
+                ScriptType::Decode,
+                "handler-decode",
+                r#"ctx.output = { code: "0", data: "handler-decoded", msg: "" };"#,
+            )
+            .await
+            .unwrap();
+        let state = Arc::new(
+            AdminState::new(19093)
+                .with_traffic_db_store_shared(harness.traffic_db.clone())
+                .with_body_store(harness.body_store.clone())
+                .with_config_manager_shared(harness.config_manager.clone())
+                .with_script_manager(manager),
+        );
+
+        let upstream = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::body_string("handler-script-request"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/plain")
+                    .set_body_string("handler-upstream"),
+            )
+            .mount(&upstream)
+            .await;
+        let rules = ResolvedRules {
+            host: Some(upstream.address().to_string()),
+            host_protocol: Some(Protocol::Http),
+            req_scripts: vec!["handler-request".to_string()],
+            res_scripts: vec!["handler-response".to_string()],
+            decode_scripts: vec!["handler-decode".to_string()],
+            values: HashMap::from([("handler".to_string(), "coverage".to_string())]),
+            ..Default::default()
+        };
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("http://source.test/scripts?coverage=1")
+            .header(header::HOST, "source.test")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .header(header::CONTENT_LENGTH, "8")
+            .body(Full::new(Bytes::from_static(b"original")))
+            .unwrap();
+        let response = run_full_request(rules, Some(state), request, 1024, 64, true).await;
+        assert_eq!(response.status().as_u16(), 208);
+        assert_eq!(
+            response_body(response).await,
+            Bytes::from_static(b"data: handler-script-response\\n\\ndata: [DONE]\\n\\n")
+        );
+
+        assert!(harness.traffic_db.count() >= 1);
+        let record = harness
+            .traffic_db
+            .get_by_id("REQ-handler-coverage")
+            .expect("scripted handler traffic record");
+        assert_eq!(record.frame_count, 1);
+    }
+
+    #[tokio::test]
+    async fn plaintext_connection_failure_applies_override_and_records_error() {
+        let harness = bifrost_admin::test_support::TestAdminState::builder()
+            .port(19094)
+            .build();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable = listener.local_addr().unwrap();
+        drop(listener);
+        let rules = ResolvedRules {
+            host: Some(unavailable.to_string()),
+            host_protocol: Some(Protocol::Http),
+            replace_status: Some(520),
+            res_body: Some(Bytes::from_static(b"handler-connect-error")),
+            res_headers: vec![("x-handler-error".to_string(), "overridden".to_string())],
+            ..Default::default()
+        };
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("http://source.test/unavailable")
+            .header(header::HOST, "source.test")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let response =
+            run_full_request(rules, Some(harness.state()), request, 1024, 64, true).await;
+        assert_eq!(response.status().as_u16(), 520);
+        assert_eq!(response.headers()["x-handler-error"], "overridden");
+        assert_eq!(
+            response_body(response).await,
+            Bytes::from_static(b"handler-connect-error")
+        );
+    }
+
+    #[tokio::test]
+    async fn plaintext_breakpoints_edit_request_and_response_bodies() {
+        use bifrost_admin::breakpoint::{BreakpointEdit, BreakpointSettings};
+
+        let harness = bifrost_admin::test_support::TestAdminState::builder()
+            .port(19097)
+            .build();
+        let state = harness.state();
+        state
+            .breakpoint_manager
+            .update_settings(BreakpointSettings {
+                enabled: true,
+                max_body_bytes: 4096,
+            });
+
+        let upstream = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/breakpoint"))
+            .and(wiremock::matchers::body_string("handler-edited-request"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_string("handler-upstream-response")
+                    .insert_header("content-type", "text/plain")
+                    .insert_header("content-length", "25"),
+            )
+            .mount(&upstream)
+            .await;
+        let rules = ResolvedRules {
+            host: Some(upstream.address().to_string()),
+            host_protocol: Some(Protocol::Http),
+            rules: vec![breakpoint_rule("both")],
+            ..Default::default()
+        };
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("http://source.test/breakpoint")
+            .header(header::HOST, "source.test")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .header(header::CONTENT_LENGTH, "8")
+            .body(Full::new(Bytes::from_static(b"original")))
+            .unwrap();
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            run_full_request(rules, Some(task_state), request, 4096, 64, true).await
+        });
+
+        wait_for_breakpoint(&state).await;
+        assert!(state.breakpoint_manager.resume(
+            "REQ-handler-coverage",
+            "request",
+            BreakpointEdit {
+                headers: vec![("x-handler-request-breakpoint".into(), "yes".into())],
+                body: Some("handler-edited-request".into()),
+            },
+        ));
+        wait_for_breakpoint(&state).await;
+        assert!(state.breakpoint_manager.resume(
+            "REQ-handler-coverage",
+            "response",
+            BreakpointEdit {
+                headers: vec![("x-handler-response-breakpoint".into(), "yes".into())],
+                body: Some("handler-edited-response".into()),
+            },
+        ));
+
+        let response = task.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-handler-response-breakpoint"], "yes");
+        assert_eq!(
+            response_body(response).await,
+            Bytes::from_static(b"handler-edited-response")
+        );
+        let record = harness
+            .traffic_db
+            .get_by_id("REQ-handler-coverage")
+            .expect("handler breakpoint traffic record");
+        assert_eq!(record.status, 200);
+        assert!(record.request_body_ref.is_some());
+        assert!(record.response_body_ref.is_some());
+    }
+
+    #[tokio::test]
+    async fn plaintext_html_devtools_covers_identity_gzip_and_invalid_encoding() {
+        let harness = bifrost_admin::test_support::TestAdminState::builder()
+            .port(19098)
+            .build();
+        let upstream = wiremock::MockServer::start().await;
+        let html = b"<html><head></head><body><script src=\"/asset.js\"></script></body></html>";
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/identity"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_bytes(html.to_vec())
+                    .insert_header("content-type", "text/html"),
+            )
+            .mount(&upstream)
+            .await;
+        let compressed = compress_body(html, "gzip").unwrap();
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gzip"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_bytes(compressed)
+                    .insert_header("content-type", "text/html")
+                    .insert_header("content-encoding", "gzip"),
+            )
+            .mount(&upstream)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/invalid-gzip"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_bytes(b"not-gzip".to_vec())
+                    .insert_header("content-type", "text/html")
+                    .insert_header("content-encoding", "gzip"),
+            )
+            .mount(&upstream)
+            .await;
+
+        for (path, expect_injected) in [("identity", true), ("gzip", true), ("invalid-gzip", false)]
+        {
+            let rules = ResolvedRules {
+                host: Some(upstream.address().to_string()),
+                host_protocol: Some(Protocol::Http),
+                devtools: Some(crate::server::DevtoolsRule::default()),
+                ..Default::default()
+            };
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri(format!("http://source.test/{path}"))
+                .header(header::HOST, "source.test")
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let response =
+                run_full_request(rules, Some(harness.state()), request, 4096, 64, true).await;
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "no-store, no-cache, must-revalidate, max-age=0"
+            );
+            let encoding = response
+                .headers()
+                .get(header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string);
+            let body = response_body(response).await;
+            let decoded = crate::transform::decompress_body_with_limit(
+                &body,
+                encoding.as_deref(),
+                10 * 1024 * 1024,
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&decoded).contains("__bifrost_devtools_bridge__"),
+                expect_injected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plaintext_chunked_request_and_response_cover_unknown_lengths() {
+        let (address, upstream_task) = chunked_http_fixture().await;
+        let rules = ResolvedRules {
+            host: Some(address.to_string()),
+            host_protocol: Some(Protocol::Http),
+            req_replace: vec![("old".into(), "new".into())],
+            res_replace: vec![("chunked".into(), "streamed".into())],
+            ..Default::default()
+        };
+        let frames = futures_util::stream::iter(vec![
+            Ok::<_, Infallible>(hyper::body::Frame::data(Bytes::from_static(b"stream-new-"))),
+            Ok::<_, Infallible>(hyper::body::Frame::data(Bytes::from_static(b"body"))),
+        ]);
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("http://source.test/chunked")
+            .header(header::HOST, "source.test")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(StreamBody::new(frames))
+            .unwrap();
+        let response = run_full_request(rules, None, request, 4096, 64, true).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_body(response).await,
+            Bytes::from_static(b"streamed-response")
+        );
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn plaintext_full_admin_streams_binary_sse_and_oversized_request_bodies() {
+        let harness = bifrost_admin::test_support::TestAdminState::builder()
+            .port(19095)
+            .build();
+        harness.state().set_binary_traffic_performance_mode(true);
+        let upstream = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/binary"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(vec![0x7b; 256]),
+            )
+            .mount(&upstream)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/events"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: handler-one\n\ndata: handler-two\n\n"),
+            )
+            .mount(&upstream)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/large"))
+            .and(wiremock::matchers::body_string("0123456789abcdef"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .mount(&upstream)
+            .await;
+
+        for (path, expected_len) in [("binary", 256_usize), ("events", 38_usize)] {
+            let rules = ResolvedRules {
+                host: Some(upstream.address().to_string()),
+                host_protocol: Some(Protocol::Http),
+                ..Default::default()
+            };
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri(format!("http://source.test/{path}"))
+                .header(header::HOST, "source.test")
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let response =
+                run_full_request(rules, Some(harness.state()), request, 8, 8, true).await;
+            assert_eq!(response_body(response).await.len(), expected_len);
+        }
+
+        let rules = ResolvedRules {
+            host: Some(upstream.address().to_string()),
+            host_protocol: Some(Protocol::Http),
+            req_replace: vec![("0".to_string(), "x".to_string())],
+            ..Default::default()
+        };
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("http://source.test/large")
+            .header(header::HOST, "source.test")
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(header::CONTENT_LENGTH, "16")
+            .body(Full::new(Bytes::from_static(b"0123456789abcdef")))
+            .unwrap();
+        let response = run_full_request(rules, Some(harness.state()), request, 4, 2, true).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let _ = response_body(response).await;
+    }
+
+    #[tokio::test]
+    async fn immediate_status_and_file_responses_execute_response_scripts() {
+        use bifrost_admin::ScriptManager;
+        use bifrost_script::ScriptType;
+
+        let harness = bifrost_admin::test_support::TestAdminState::builder()
+            .port(19096)
+            .build();
+        let manager = ScriptManager::new(harness.data_dir().join("immediate-response-scripts"));
+        manager.init().await.unwrap();
+        manager
+            .engine()
+            .save_script(
+                ScriptType::Response,
+                "immediate-response",
+                r#"response.status = 218; response.headers["x-immediate-script"] = "yes"; response.body = "scripted-immediate";"#,
+            )
+            .await
+            .unwrap();
+        let state = Arc::new(
+            AdminState::new(19096)
+                .with_traffic_db_store_shared(harness.traffic_db.clone())
+                .with_body_store(harness.body_store.clone())
+                .with_config_manager_shared(harness.config_manager.clone())
+                .with_script_manager(manager),
+        );
+
+        for (index, rules) in [
+            ResolvedRules {
+                status_code: Some(217),
+                res_scripts: vec!["immediate-response".into()],
+                values: HashMap::from([("source".into(), "status".into())]),
+                ..Default::default()
+            },
+            ResolvedRules {
+                mock_file: Some("(file before script)".into()),
+                res_scripts: vec!["immediate-response".into()],
+                values: HashMap::from([("source".into(), "file".into())]),
+                ..Default::default()
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://immediate.test/{index}"))
+                .header(header::HOST, "immediate.test")
+                .body(Full::new(Bytes::from_static(b"request-body")))
+                .unwrap();
+            let response =
+                run_full_request(rules, Some(state.clone()), request, 1024, 64, true).await;
+            assert_eq!(response.status().as_u16(), 218);
+            assert_eq!(response.headers()["x-immediate-script"], "yes");
+            assert_eq!(
+                response_body(response).await,
+                Bytes::from_static(b"scripted-immediate")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plaintext_websocket_covers_upstream_success_rejection_and_connect_failure() {
+        for status in [101_u16, 403] {
+            let (address, upstream_task) = websocket_fixture(status).await;
+            let rules = ResolvedRules {
+                host: Some(address.to_string()),
+                host_protocol: Some(Protocol::Http),
+                req_headers: vec![("x-handler-coverage".into(), "request".into())],
+                res_headers: vec![("x-handler-response".into(), "yes".into())],
+                ..Default::default()
+            };
+            let response = run_full_request(
+                rules,
+                Some(Arc::new(AdminState::new(19096))),
+                handler_websocket_request(),
+                4096,
+                64,
+                true,
+            )
+            .await;
+            if status == 101 {
+                assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+                assert_eq!(response.headers()["x-upstream-handler"], "yes");
+                assert_eq!(response.headers()["x-handler-response"], "yes");
+                assert_eq!(response.headers()["sec-websocket-protocol"], "chat.v1");
+            } else {
+                assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            }
+            let _ = response_body(response).await;
+            upstream_task.await.unwrap();
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable = listener.local_addr().unwrap();
+        drop(listener);
+        let rules = ResolvedRules {
+            host: Some(unavailable.to_string()),
+            host_protocol: Some(Protocol::Http),
+            ..Default::default()
+        };
+        let response =
+            run_full_request(rules, None, handler_websocket_request(), 4096, 64, true).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn plaintext_response_breakpoint_header_only_preserves_large_body() {
+        use bifrost_admin::breakpoint::{BreakpointEdit, BreakpointSettings};
+
+        let harness = bifrost_admin::test_support::TestAdminState::builder()
+            .port(19100)
+            .build();
+        let state = harness.state();
+        state
+            .breakpoint_manager
+            .update_settings(BreakpointSettings {
+                enabled: true,
+                max_body_bytes: 8,
+            });
+        let upstream = wiremock::MockServer::start().await;
+        let large_body = "handler-large-response-body";
+        wiremock::Mock::given(wiremock::matchers::path("/large-breakpoint"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/plain")
+                    .set_body_string(large_body),
+            )
+            .mount(&upstream)
+            .await;
+        let rules = ResolvedRules {
+            host: Some(upstream.address().to_string()),
+            host_protocol: Some(Protocol::Http),
+            rules: vec![breakpoint_rule("response")],
+            ..Default::default()
+        };
+        let request = Request::builder()
+            .uri("http://source.test/large-breakpoint")
+            .header(header::HOST, "source.test")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            run_full_request(rules, Some(task_state), request, 4096, 64, true).await
+        });
+        wait_for_breakpoint(&state).await;
+        assert!(state.breakpoint_manager.resume(
+            "REQ-handler-coverage",
+            "response",
+            BreakpointEdit {
+                headers: vec![("x-header-only".into(), "yes".into())],
+                body: None,
+            },
+        ));
+        let response = task.await.unwrap();
+        assert_eq!(response.headers()["x-header-only"], "yes");
+        assert_eq!(response_body(response).await, Bytes::from(large_body));
+    }
+
+    #[tokio::test]
+    async fn plaintext_badge_injection_covers_identity_gzip_and_invalid_encoding() {
+        let upstream = wiremock::MockServer::start().await;
+        let html = b"<html><head></head><body>badge</body></html>";
+        let gzip = compress_body(html, "gzip").unwrap();
+        for (path, body, encoding, expected) in [
+            ("identity", html.to_vec(), None, true),
+            ("gzip", gzip, Some("gzip"), true),
+            ("invalid", b"invalid-gzip".to_vec(), Some("gzip"), false),
+        ] {
+            let mut template = wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/html")
+                .set_body_bytes(body);
+            if let Some(encoding) = encoding {
+                template = template.insert_header("content-encoding", encoding);
+            }
+            wiremock::Mock::given(wiremock::matchers::path(format!("/badge-{path}")))
+                .respond_with(template)
+                .mount(&upstream)
+                .await;
+            let rules = ResolvedRules {
+                host: Some(upstream.address().to_string()),
+                host_protocol: Some(Protocol::Http),
+                ..Default::default()
+            };
+            let request = Request::builder()
+                .uri(format!("http://source.test/badge-{path}"))
+                .header(header::HOST, "source.test")
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let response =
+                run_full_request_config(rules, None, request, 4096, 64, true, true).await;
+            let encoding = response
+                .headers()
+                .get(header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string);
+            let body = response_body(response).await;
+            let decoded = crate::transform::decompress_body_with_limit(
+                &body,
+                encoding.as_deref(),
+                10 * 1024 * 1024,
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&decoded).contains("__bifrost_badge__"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn retryable_request_blueprint_rebuilds_http1_request() {
+        let blueprint = RetryableRequestBlueprint {
+            method: Method::PATCH,
+            uri: "https://retry.test/resource".parse().unwrap(),
+            headers: hyper::HeaderMap::from_iter([(
+                header::HeaderName::from_static("x-retry"),
+                header::HeaderValue::from_static("yes"),
+            )]),
+            body: Bytes::from_static(b"retry-body"),
+        };
+        let request = blueprint.build().unwrap();
+        assert_eq!(request.version(), hyper::Version::HTTP_11);
+        assert_eq!(request.method(), Method::PATCH);
+        assert_eq!(request.uri(), "https://retry.test/resource");
+        assert_eq!(request.headers()["x-retry"], "yes");
+    }
+
+    #[cfg(feature = "http3")]
+    #[tokio::test]
+    async fn plaintext_http3_attempt_falls_back_after_unavailable_quic_origin() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable = listener.local_addr().unwrap();
+        drop(listener);
+        let rules = ResolvedRules {
+            host: Some(unavailable.to_string()),
+            host_protocol: Some(Protocol::Https),
+            upstream_http3: true,
+            upstream_unsafe_ssl: true,
+            ..Default::default()
+        };
+        let request = Request::builder()
+            .uri("http://source.test/http3-fallback")
+            .header(header::HOST, "source.test")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let response = run_full_request(rules, None, request, 4096, 64, true).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn ignored_mock_redirect_records_terminal_redirect_with_admin() {
+        let rules = ResolvedRules {
+            redirect: Some("https://redirect.test/final".to_string()),
+            redirect_status: Some(307),
+            ignored: crate::server::IgnoredFields {
+                all: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let request = Request::builder()
+            .uri("http://source.test/ignored-redirect")
+            .header(header::HOST, "source.test")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let response = run_full_request(
+            rules,
+            Some(Arc::new(AdminState::new(19100))),
+            request,
+            1024,
+            64,
+            true,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            response.headers()[header::LOCATION],
+            "https://redirect.test/final"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_connect_tunnel_reports_closed_invalid_and_oversized_responses() {
+        for (response, expected) in [
+            (Vec::new(), "closed before CONNECT completed"),
+            (
+                b"invalid response\r\n\r\n".to_vec(),
+                "Invalid upstream proxy CONNECT response",
+            ),
+            (vec![b'x'; 17 * 1024], "CONNECT response is too large"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = vec![0_u8; 2048];
+                let _ = stream.read(&mut request).await.unwrap();
+                if !response.is_empty() {
+                    stream.write_all(&response).await.unwrap();
+                }
+            });
+            let error = connect_via_upstream_http_proxy_tunnel(
+                &format!("http://{address}"),
+                "target.test",
+                443,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_forward_proxy_reports_missing_target_and_connect_failure() {
+        let (parts, _) = Request::builder()
+            .uri("/relative")
+            .body(())
+            .unwrap()
+            .into_parts();
+        let error = send_request_via_upstream_proxy(
+            "http://127.0.0.1:1",
+            "/relative".parse().unwrap(),
+            parts,
+            crate::server::empty_body(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("Missing target authority"));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable = listener.local_addr().unwrap();
+        drop(listener);
+        let (parts, _) = Request::builder()
+            .uri("http://target.test/path")
+            .body(())
+            .unwrap()
+            .into_parts();
+        let error = send_request_via_upstream_proxy(
+            &format!("http://{unavailable}"),
+            "http://target.test/path".parse().unwrap(),
+            parts,
+            crate::server::empty_body(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Failed to connect to upstream proxy"));
+    }
+
+    #[tokio::test]
+    async fn invalid_upstream_uri_and_host_rule_prefix_rewrite_are_reported_and_applied() {
+        let invalid = ResolvedRules {
+            host: Some("[invalid-host".to_string()),
+            host_protocol: Some(Protocol::Http),
+            ..Default::default()
+        };
+        let request = Request::builder()
+            .uri("http://source.test/invalid")
+            .header(header::HOST, "source.test")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        assert_eq!(
+            run_full_request(invalid, None, request, 1024, 64, true)
+                .await
+                .status(),
+            StatusCode::BAD_GATEWAY
+        );
+
+        let upstream = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("rewritten"))
+            .mount(&upstream)
+            .await;
+        let target = format!("{}/base", upstream.address());
+        let rule = crate::server::RuleValue {
+            pattern: "source.test/api".to_string(),
+            protocol: Protocol::Http,
+            value: target.clone(),
+            options: HashMap::new(),
+            rule_name: Some("coverage-prefix".to_string()),
+            raw: None,
+            line: Some(1),
+            auto_tls_intercept: true,
+        };
+        let rules = ResolvedRules {
+            host: Some(target),
+            host_protocol: Some(Protocol::Http),
+            rules: vec![rule],
+            ..Default::default()
+        };
+        let request = Request::builder()
+            .uri("http://source.test/api/item")
+            .header(header::HOST, "source.test")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let response = run_full_request(rules, None, request, 1024, 64, true).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_body(response).await,
+            Bytes::from_static(b"rewritten")
+        );
+        let requests = upstream.received_requests().await.unwrap();
+        let path = requests[0].url.path();
+        assert!(path.contains("base") && path.contains("item"), "{path}");
+    }
+
+    #[tokio::test]
+    async fn direct_status_request_script_mutates_method_headers_and_body() {
+        use bifrost_admin::ScriptManager;
+        use bifrost_script::ScriptType;
+
+        let harness = bifrost_admin::test_support::TestAdminState::builder()
+            .port(19101)
+            .build();
+        let manager = ScriptManager::new(harness.data_dir().join("direct-request-script"));
+        manager.init().await.unwrap();
+        manager
+            .engine()
+            .save_script(
+                ScriptType::Request,
+                "direct-request",
+                r#"request.method = "PATCH"; request.headers["x-scripted"] = "yes"; request.body = "scripted-direct-body";"#,
+            )
+            .await
+            .unwrap();
+        let state = Arc::new(
+            AdminState::new(19101)
+                .with_traffic_db_store_shared(harness.traffic_db.clone())
+                .with_body_store(harness.body_store.clone())
+                .with_config_manager_shared(harness.config_manager.clone())
+                .with_script_manager(manager),
+        );
+        let rules = ResolvedRules {
+            status_code: Some(219),
+            req_scripts: vec!["direct-request".to_string()],
+            ..Default::default()
+        };
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("http://source.test/direct-script")
+            .header(header::HOST, "source.test")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Full::new(Bytes::from_static(b"original")))
+            .unwrap();
+        let response = run_full_request(rules, Some(state), request, 1024, 64, true).await;
+        assert_eq!(response.status().as_u16(), 219);
+        let record = harness
+            .traffic_db
+            .get_by_id("REQ-handler-coverage")
+            .expect("direct scripted traffic");
+        assert_eq!(record.method, "PATCH");
+        assert!(record
+            .request_headers
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("x-scripted") && value == "yes"));
+    }
+
+    #[tokio::test]
+    async fn unknown_length_oversized_request_and_response_use_admin_streaming_tees() {
+        let harness = bifrost_admin::test_support::TestAdminState::builder()
+            .port(19102)
+            .build();
+        let (address, upstream_task) = chunked_http_fixture().await;
+        let rules = ResolvedRules {
+            host: Some(address.to_string()),
+            host_protocol: Some(Protocol::Http),
+            req_replace: vec![("old".to_string(), "new".to_string())],
+            res_replace: vec![("chunked".to_string(), "new".to_string())],
+            ..Default::default()
+        };
+        let frames = futures_util::stream::iter(vec![
+            Ok::<_, Infallible>(hyper::body::Frame::data(Bytes::from_static(b"stream-new-"))),
+            Ok::<_, Infallible>(hyper::body::Frame::data(Bytes::from_static(b"body"))),
+        ]);
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("http://source.test/unknown-oversized")
+            .header(header::HOST, "source.test")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(StreamBody::new(frames))
+            .unwrap();
+        let response = run_full_request(rules, Some(harness.state()), request, 4, 2, true).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_body(response).await,
+            Bytes::from_static(b"chunked-response")
+        );
+        upstream_task.abort();
     }
 }

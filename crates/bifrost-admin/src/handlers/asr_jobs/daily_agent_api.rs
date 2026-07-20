@@ -314,8 +314,14 @@ async fn post_daily_agent_run_response(
     tokio::spawn(async move {
         if let Some(agent_id) = agent_id_clone.as_deref() {
             if let Some(agent) = selected_daily_agent(&task_clone, Some(agent_id)) {
-                let agent_task = task_for_daily_agent(&task_clone, &agent);
-                run_daily_agent(&agent_task, "manual", date_clone.as_deref(), force).await;
+                run_selected_daily_agent_with_dependencies(
+                    &task_clone,
+                    &agent,
+                    "manual",
+                    date_clone.as_deref(),
+                    force,
+                )
+                .await;
             }
         } else {
             run_daily_agents(&task_clone, "manual", date_clone.as_deref(), force).await;
@@ -383,7 +389,7 @@ async fn post_daily_agent_sync_response(task_id: &str) -> Response<BoxBody> {
         return error_response(StatusCode::NOT_FOUND, "ASR task not found");
     };
 
-    let (sync_result, per_agent_results) = match sync_all_daily_agent_reports_by_agent_isolated(task.clone()).await {
+    let (sync_result, per_agent_results, original_result) = match sync_all_daily_agent_reports_by_agent_isolated(task.clone()).await {
         Ok(result) => result,
         Err(error) => {
             let message = error.message();
@@ -404,6 +410,10 @@ async fn post_daily_agent_sync_response(task_id: &str) -> Response<BoxBody> {
             );
         }
     };
+
+    if let Err(error) = update_daily_agent_original_sync_status(&task, original_result) {
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error);
+    }
 
     for (agent_task, agent_result) in per_agent_results {
         if let Err(error) = update_daily_agent_report_sync_status(&agent_task, agent_result) {
@@ -463,6 +473,8 @@ fn build_daily_agent_records(
         .keys()
         .all(|key| !key.contains(':'));
     let task = find_task(task_id).unwrap_or_else(|| AsrDirectoryTask {
+        transcription_mode: AsrTranscriptionMode::Standard,
+        transcription_prompt: String::new(),
         id: task_id.to_string(),
         name: task_id.to_string(),
         audio_dir: PathBuf::new(),

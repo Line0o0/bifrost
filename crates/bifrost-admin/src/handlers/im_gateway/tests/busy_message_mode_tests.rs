@@ -17,33 +17,6 @@ fn runner_config(
 }
 
 #[test]
-fn busy_default_mode_is_guide_for_builtin_bifrost_agent() {
-    assert_eq!(
-        busy_default_mode_for_agent_config(
-            &bifrost_agent::AgentConfig {
-                runner: None,
-                ..Default::default()
-            },
-            &Default::default(),
-            None,
-        ),
-        BusyMessageDefaultMode::Guide
-    );
-
-    assert_eq!(
-        busy_default_mode_for_agent_config(
-            &bifrost_agent::AgentConfig {
-                runner: Some(bifrost_agent::AgentRunnerMode::BifrostAgent),
-                ..Default::default()
-            },
-            &Default::default(),
-            None,
-        ),
-        BusyMessageDefaultMode::Guide
-    );
-}
-
-#[test]
 fn busy_default_mode_guides_external_runners_except_chatgpt_web() {
     for (runner_id, adapter) in [
         ("codex-main", "codex"),
@@ -84,7 +57,7 @@ fn busy_default_mode_guides_external_runners_except_chatgpt_web() {
 }
 
 #[test]
-fn apply_busy_message_default_guides_builtin_messages_without_queueing() {
+fn apply_busy_message_default_guides_messages_without_queueing() {
     let manager = SessionQueueManager::new();
 
     let result = apply_busy_message_default(
@@ -144,6 +117,25 @@ fn apply_busy_message_default_queues_custom_runner_messages() {
         manager.pop_queue("busy-default-queue").as_deref(),
         Some("下一条给 ChatGPT Web")
     );
+}
+
+#[test]
+fn ordinary_busy_messages_always_queue_without_creating_guides() {
+    let manager = SessionQueueManager::new();
+
+    assert_eq!(
+        enqueue_busy_default_message(&manager, "empty", "   ", Vec::new()),
+        Err("消息内容不能为空")
+    );
+
+    for session in ["builtin-busy", "external-busy", "web-busy"] {
+        let items =
+            enqueue_busy_default_message(&manager, session, "  下一条独立问题  ", Vec::new())
+                .expect("ordinary busy message should queue");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].message, "下一条独立问题");
+        assert!(manager.guide_status(session).is_empty());
+    }
 }
 
 #[test]

@@ -201,20 +201,22 @@ fn is_explicit_attachment_label_or_path(label: &str, path: &str) -> bool {
 pub(super) async fn download_agent_reply_remote_attachment(
     attachment: &AgentReplyRemoteAttachment,
 ) -> bifrost_core::Result<AgentReplyDownloadedAttachment> {
-    let http = bifrost_core::outbound_reqwest_client_builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|error| {
-            bifrost_core::BifrostError::Network(format!(
-                "build agent reply attachment downloader failed: {error}"
-            ))
-        })?;
-    let response = http.get(&attachment.url).send().await.map_err(|error| {
+    let http = bifrost_core::outbound_reqwest_client().map_err(|error| {
         bifrost_core::BifrostError::Network(format!(
-            "download agent reply attachment failed: {}",
-            bifrost_core::format_reqwest_error(&error)
+            "build agent reply attachment downloader failed: {error}"
         ))
     })?;
+    let response = http
+        .get(&attachment.url)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|error| {
+            bifrost_core::BifrostError::Network(format!(
+                "download agent reply attachment failed: {}",
+                bifrost_core::format_reqwest_error(&error)
+            ))
+        })?;
     if !response.status().is_success() {
         return Err(bifrost_core::BifrostError::Network(format!(
             "download agent reply attachment returned HTTP {}",
@@ -454,6 +456,7 @@ pub(super) async fn send_agent_reply_attachments(
                 "[file:{label}] local={}",
                 attachment.path.display()
             )),
+            content: Some(format!("[file:{label}]")),
             trigger: Some("agent".to_string()),
             error: error_msg,
             sender_open_id: None,
@@ -508,38 +511,5 @@ pub(super) async fn send_agent_reply_assets(
             message_log_store,
         )
         .await;
-    }
-}
-
-pub(super) async fn send_agent_reply_images_for_event(
-    client: &ImProviderClient,
-    provider: &ImProviderConfig,
-    event: &ImEvent,
-    images: &[AgentReplyLocalImage],
-    attachments: &[AgentReplyLocalAttachment],
-    message_log_store: &Arc<ImMessageLogStore>,
-) {
-    if images.is_empty() && attachments.is_empty() {
-        return;
-    }
-    if let Some(reply_target) = build_agent_reply_target(
-        provider,
-        event,
-        "__agent_reply__",
-        "Agent Reply",
-        "interactive",
-    ) {
-        send_agent_reply_assets(
-            client,
-            provider,
-            event,
-            &reply_target,
-            images,
-            attachments,
-            message_log_store,
-        )
-        .await;
-    } else {
-        error!("no reply target to send agent reply attachments");
     }
 }

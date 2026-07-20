@@ -1,8 +1,10 @@
 //! Session queue manager for IM guide mode and queue mode.
 //!
 //! Two messaging modes when a session is busy:
-//! - **Guide mode** (default): inject message mid-turn, consumed after current tool call batch
-//! - **Queue mode** (`/q <msg>`): FIFO queue, processed after current turn completes
+//! - **Queue mode** (default for ordinary IM messages): FIFO queue, processed after current turn
+//!   completes
+//! - **Guide mode** (`/g <msg>` in IM or Guide selection in WebUI): mid-turn guidance for
+//!   runtimes that support it
 
 use dashmap::DashMap;
 use serde::Serialize;
@@ -508,7 +510,7 @@ mod tests {
         mgr.inject_guide("s1", "请帮我分析这个问题".into());
 
         // ── The fix: drain guide_channel BEFORE checking queue/clear ──
-        // This is what `run_agent_chat_with_interleave` now does after turn completes.
+        // The external runner event loop drains this queue after each turn completes.
         let unconsumed: Vec<String> = channel.lock().unwrap().drain(..).collect();
         assert_eq!(unconsumed, vec!["请帮我分析这个问题".to_string()]);
 

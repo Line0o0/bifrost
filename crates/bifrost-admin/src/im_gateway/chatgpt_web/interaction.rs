@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -201,6 +202,7 @@ struct TerminalReadyCandidate {
     waited: WaitedFinal,
     text_len: usize,
     image_count: usize,
+    signature: u64,
     stable_since: tokio::time::Instant,
 }
 
@@ -360,12 +362,18 @@ pub(super) async fn wait_final(
                     .and_then(Value::as_str)
                     .map(|s| s.len())
                     .unwrap_or(0);
+                let dom_text = waited
+                    .final_message
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 let dom_image_count = waited
                     .final_message
                     .get("generatedImages")
                     .and_then(|v| v.as_array())
                     .map(|a| a.len())
                     .unwrap_or(0);
+                let ready_signature = dom_ready_signature(&waited);
                 let now = tokio::time::Instant::now();
                 let stable_since = *terminal_idle_since.get_or_insert(now);
                 let terminal_idle_stable_for = options.terminal_idle_stable_for;
@@ -382,7 +390,7 @@ pub(super) async fn wait_final(
                     continue;
                 }
 
-                let settle_for = dom_terminal_content_settle_for(dom_text_len, dom_image_count);
+                let settle_for = dom_terminal_content_settle_for(dom_text, dom_image_count);
                 if settle_for.is_zero() {
                     tracing::info!(
                         conversation_id,
@@ -397,6 +405,7 @@ pub(super) async fn wait_final(
                     waited,
                     text_len: dom_text_len,
                     image_count: dom_image_count,
+                    signature: ready_signature,
                     stable_since: now,
                 };
                 match terminal_ready_candidate.as_mut() {
@@ -410,10 +419,7 @@ pub(super) async fn wait_final(
                             "chatgpt_web wait_final: terminal DOM ready, waiting for rendered content to settle"
                         );
                     }
-                    Some(candidate)
-                        if ready_candidate.text_len > candidate.text_len
-                            || ready_candidate.image_count > candidate.image_count =>
-                    {
+                    Some(candidate) if ready_candidate.signature != candidate.signature => {
                         tracing::info!(
                             conversation_id,
                             previous_text_len = candidate.text_len,
@@ -421,7 +427,7 @@ pub(super) async fn wait_final(
                             previous_image_count = candidate.image_count,
                             dom_image_count = ready_candidate.image_count,
                             required_stable_ms = settle_for.as_millis(),
-                            "chatgpt_web wait_final: terminal DOM content grew, resetting settle timer"
+                            "chatgpt_web wait_final: terminal DOM content changed, resetting settle timer"
                         );
                         terminal_ready_candidate = Some(ready_candidate);
                     }
@@ -1085,6 +1091,33 @@ pub(super) enum DomExtractOutcome {
     NotFound,
 }
 
+#[cfg(test)]
+fn test_dom_outcomes() -> &'static std::sync::Mutex<BTreeMap<String, Vec<DomExtractOutcome>>> {
+    static OUTCOMES: std::sync::OnceLock<
+        std::sync::Mutex<BTreeMap<String, Vec<DomExtractOutcome>>>,
+    > = std::sync::OnceLock::new();
+    OUTCOMES.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn set_test_dom_outcomes(conversation_id: &str, outcomes: Vec<DomExtractOutcome>) {
+    test_dom_outcomes()
+        .lock()
+        .expect("test DOM outcomes lock")
+        .insert(conversation_id.to_string(), outcomes);
+}
+
+#[cfg(test)]
+fn take_test_dom_outcome(conversation_id: &str) -> Option<DomExtractOutcome> {
+    let mut outcomes = test_dom_outcomes().lock().expect("test DOM outcomes lock");
+    let queue = outcomes.get_mut(conversation_id)?;
+    if queue.is_empty() {
+        outcomes.remove(conversation_id);
+        return None;
+    }
+    Some(queue.remove(0))
+}
+
 /// Extract the latest assistant message content directly from the page DOM.
 ///
 /// This is a fallback for when the backend API returns 429 but the page
@@ -1100,6 +1133,9 @@ pub(super) async fn try_extract_latest_from_dom(
 ) -> Option<WaitedFinal> {
     let tab = super::browser::get_conversation_tab(profile_dir, conversation_id)?;
     if tab.cdp.is_closed() {
+        return None;
+    }
+    if !dom_tab_matches_conversation(&tab.cdp, super::DEFAULT_BASE_URL, conversation_id).await {
         return None;
     }
     // Guard: CDP evaluate can hang if the page is in a bad state.
@@ -1139,7 +1175,7 @@ async fn extract_latest_assistant_from_dom(cdp: &super::CdpClient) -> Option<Wai
           // ── Guard 1: Verify we're on a conversation page, not the homepage ──
           // After 429, ChatGPT sometimes redirects to the homepage.
           const path = window.location.pathname || '';
-          if (!path.startsWith('/c/')) {
+          if (!path.includes('/c/')) {
             return JSON.stringify({ found: false, reason: 'not_on_conversation_page' });
           }
 
@@ -1584,6 +1620,11 @@ pub(super) async fn try_extract_dom_outcome(
     profile_dir: &Path,
     conversation_id: &str,
 ) -> DomExtractOutcome {
+    #[cfg(test)]
+    if let Some(outcome) = take_test_dom_outcome(conversation_id) {
+        return outcome;
+    }
+
     let tab = match super::browser::get_conversation_tab(profile_dir, conversation_id) {
         Some(tab) => tab,
         None => {
@@ -1608,7 +1649,7 @@ pub(super) async fn try_extract_dom_outcome(
     }
     match tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        extract_dom_outcome_inner(&tab.cdp),
+        extract_dom_outcome_inner(&tab.cdp, &config.chatgpt.base_url, conversation_id),
     )
     .await
     {
@@ -1624,13 +1665,20 @@ pub(super) async fn try_extract_dom_outcome(
 }
 
 /// Inner implementation that returns DomExtractOutcome.
-async fn extract_dom_outcome_inner(cdp: &super::CdpClient) -> DomExtractOutcome {
+async fn extract_dom_outcome_inner(
+    cdp: &super::CdpClient,
+    base_url: &str,
+    conversation_id: &str,
+) -> DomExtractOutcome {
+    if !dom_tab_matches_conversation(cdp, base_url, conversation_id).await {
+        return DomExtractOutcome::NotFound;
+    }
     let js = format!(
         r#"(() => {{
           {html_to_md}
 
           const path = window.location.pathname || '';
-          if (!path.startsWith('/c/')) {{
+          if (!path.includes('/c/')) {{
             return JSON.stringify({{ found: false, reason: 'not_on_conversation_page' }});
           }}
           const isVisible = (el) => !!(
@@ -1660,6 +1708,7 @@ async fn extract_dom_outcome_inner(cdp: &super::CdpClient) -> DomExtractOutcome 
             turnId = lastTurn.getAttribute('data-turn-id') || '';
           }}
           let assistantBatchNodes = [];
+          let provisionalAssistantShell = false;
           if (roleMessageNodes.length > 0) {{
             let lastUserIdx = -1;
             for (let i = 0; i < roleMessageNodes.length; i++) {{
@@ -1700,8 +1749,29 @@ async fn extract_dom_outcome_inner(cdp: &super::CdpClient) -> DomExtractOutcome 
                 turnId = lastTurn.getAttribute('data-turn-id') ||
                   lastTurn.getAttribute('data-testid') ||
                   turnId;
+                const hasCommittedAssistantMessage = !!(
+                  lastTurn.matches('[data-message-author-role="assistant"][data-message-id]') ||
+                  lastTurn.querySelector('[data-message-author-role="assistant"][data-message-id]')
+                );
+                const hasGeneratedImage = lastTurn.querySelector(
+                  'img[alt^="已生成图片"], img[alt^="Generated image"], img[src*="estuary/content"], img[src*="oaidalleapi"], img[src*="dall-e"]'
+                ) !== null;
+                provisionalAssistantShell = !hasCommittedAssistantMessage && !hasGeneratedImage;
               }}
             }}
+          }}
+          if (assistantBatchNodes.length === 0 && roleMessageNodes.length > 0) {{
+            const userNodes = roleMessageNodes
+              .filter((node) => node.getAttribute('data-message-author-role') === 'user');
+            const lastUserNode = userNodes[userNodes.length - 1];
+            const hasGeneratedImageAfterLastUser = !!lastUserNode && allTurns
+              .filter((node) => !!(
+                lastUserNode.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING
+              ))
+              .some((node) => node.querySelector(
+                'img[alt^="已生成图片"], img[alt^="Generated image"], img[src*="estuary/content"], img[src*="oaidalleapi"], img[src*="dall-e"]'
+              ) !== null);
+            provisionalAssistantShell = !!lastUserNode && !hasGeneratedImageAfterLastUser;
           }}
           if (!lastTurn) {{
             return JSON.stringify({{ found: false, reason: 'no_assistant_turn' }});
@@ -1859,6 +1929,7 @@ async fn extract_dom_outcome_inner(cdp: &super::CdpClient) -> DomExtractOutcome 
             imageGenBusy,
             stopButtonVisible,
             waitingForCompleteReply,
+            provisionalAssistantShell,
             composerVisible,
             composerDisabled,
             composerTextLength,
@@ -2017,6 +2088,34 @@ async fn extract_dom_outcome_inner(cdp: &super::CdpClient) -> DomExtractOutcome 
     })
 }
 
+async fn dom_tab_matches_conversation(
+    cdp: &super::CdpClient,
+    base_url: &str,
+    conversation_id: &str,
+) -> bool {
+    let current_url = match super::evaluate_value(cdp, "window.location.href").await {
+        Ok(value) => value.as_str().unwrap_or_default().to_string(),
+        Err(error) => {
+            tracing::debug!(
+                conversation_id,
+                error = %error,
+                "chatgpt_web DOM extract: failed to read current page URL"
+            );
+            return false;
+        }
+    };
+    let matches =
+        super::browser::page_url_matches_conversation(&current_url, base_url, conversation_id);
+    if !matches {
+        tracing::debug!(
+            conversation_id,
+            current_url,
+            "chatgpt_web DOM extract: ignoring tab on a different conversation"
+        );
+    }
+    matches
+}
+
 /// Like `try_extract_latest_from_dom` but ignores streaming indicators.
 /// Used when content stability has been confirmed despite stale streaming flags.
 pub(super) async fn try_extract_latest_from_dom_force(
@@ -2036,7 +2135,12 @@ pub(super) async fn try_extract_latest_from_dom_force(
             if tab.cdp.is_closed() {
                 return None;
             }
-            extract_latest_assistant_from_dom_ignore_streaming(&tab.cdp).await
+            extract_latest_assistant_from_dom_ignore_streaming(
+                &tab.cdp,
+                &config.chatgpt.base_url,
+                conversation_id,
+            )
+            .await
         }
         DomExtractOutcome::NotFound => None,
     }
@@ -2046,7 +2150,12 @@ pub(super) async fn try_extract_latest_from_dom_force(
 /// Used when stability detection has confirmed the streaming flag is stale.
 async fn extract_latest_assistant_from_dom_ignore_streaming(
     cdp: &super::CdpClient,
+    base_url: &str,
+    conversation_id: &str,
 ) -> Option<WaitedFinal> {
+    if !dom_tab_matches_conversation(cdp, base_url, conversation_id).await {
+        return None;
+    }
     // Reuse the same JS as the main extraction but skip the isStreaming check
     // at the Rust level. The JS still reports isStreaming for logging.
     let js = format!(
@@ -2054,7 +2163,7 @@ async fn extract_latest_assistant_from_dom_ignore_streaming(
           {html_to_md}
 
           const path = window.location.pathname || '';
-          if (!path.startsWith('/c/')) {{
+          if (!path.includes('/c/')) {{
             return JSON.stringify({{ found: false, reason: 'not_on_conversation_page' }});
           }}
           const allTurns = document.querySelectorAll(
@@ -2266,20 +2375,39 @@ pub(super) fn required_dom_terminal_idle_for(_stream_handoff: bool) -> std::time
 }
 
 pub(super) fn dom_terminal_content_settle_for(
-    text_len: usize,
+    text: &str,
     image_count: usize,
 ) -> std::time::Duration {
     if image_count > 0 {
-        return std::time::Duration::from_millis(1_500);
+        return std::time::Duration::from_secs(2);
+    }
+    let text_len = text.len();
+    if text_len >= 4_096 {
+        return std::time::Duration::from_secs(5);
+    }
+    if text_len < 512 && dom_text_is_planning_prefix(text) {
+        return std::time::Duration::from_secs(15);
     }
     if text_len >= 256 {
-        return std::time::Duration::from_millis(2_000);
+        return std::time::Duration::from_secs(3);
     }
-    std::time::Duration::from_millis(750)
+    std::time::Duration::from_secs(2)
 }
 
 pub(super) fn dom_terminal_content_settle_poll_for() -> std::time::Duration {
     std::time::Duration::from_millis(500)
+}
+
+fn dom_ready_signature(waited: &WaitedFinal) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(&waited.final_message)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    waited.all_texts.hash(&mut hasher);
+    serde_json::to_string(&waited.summary)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    hasher.finish()
 }
 
 fn normalize_dom_status_text(text: &str) -> &str {
@@ -2289,6 +2417,24 @@ fn normalize_dom_status_text(text: &str) -> &str {
         .trim_start_matches("ChatGPT says")
         .trim_start_matches([':', '：'])
         .trim()
+}
+
+fn dom_text_is_planning_prefix(text: &str) -> bool {
+    let normalized = normalize_dom_status_text(text);
+    let lower = normalized.to_ascii_lowercase();
+    ["我会", "我将", "我先", "接下来我会"]
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix))
+        || [
+            "i'll",
+            "i’ll",
+            "i will",
+            "i'm going to",
+            "i’m going to",
+            "let me",
+        ]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
 }
 
 fn dom_text_is_pending_status(normalized: &str) -> bool {
@@ -2358,6 +2504,13 @@ pub(super) fn dom_output_in_progress_reason(data: &Value) -> Option<&'static str
     {
         return Some("waiting_for_complete_reply");
     }
+    if data
+        .get("provisionalAssistantShell")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Some("assistant_message_not_committed");
+    }
     let composer_visible = data
         .get("composerVisible")
         .and_then(Value::as_bool)
@@ -2420,16 +2573,28 @@ mod tests {
     #[test]
     fn dom_terminal_content_settle_waits_after_controls_idle_for_markdown_render() {
         assert_eq!(
-            dom_terminal_content_settle_for(32, 0),
-            std::time::Duration::from_millis(750)
+            dom_terminal_content_settle_for("short final answer", 0),
+            std::time::Duration::from_secs(2)
         );
         assert_eq!(
-            dom_terminal_content_settle_for(512, 0),
-            std::time::Duration::from_millis(2_000)
+            dom_terminal_content_settle_for(&"a".repeat(512), 0),
+            std::time::Duration::from_secs(3)
         );
         assert_eq!(
-            dom_terminal_content_settle_for(0, 1),
-            std::time::Duration::from_millis(1_500)
+            dom_terminal_content_settle_for("", 1),
+            std::time::Duration::from_secs(2)
+        );
+        assert_eq!(
+            dom_terminal_content_settle_for(&"a".repeat(4_096), 0),
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(
+            dom_terminal_content_settle_for("我会先检索资料，再给出完整研究。", 0),
+            std::time::Duration::from_secs(15)
+        );
+        assert_eq!(
+            dom_terminal_content_settle_for("I'll verify the primary sources first.", 0),
+            std::time::Duration::from_secs(15)
         );
         assert_eq!(
             dom_terminal_content_settle_poll_for(),
@@ -2480,6 +2645,132 @@ mod tests {
         assert_eq!(
             dom_output_in_progress_reason(&data),
             Some("stop_button_visible")
+        );
+    }
+
+    #[test]
+    fn dom_output_in_progress_reason_waits_for_committed_assistant_message() {
+        let data = json!({
+            "streamingSignal": false,
+            "imageGenBusy": false,
+            "stopButtonVisible": false,
+            "waitingForCompleteReply": false,
+            "provisionalAssistantShell": true,
+            "composerVisible": true,
+            "composerDisabled": false,
+            "composerTextLength": 0,
+            "imageCount": 0,
+            "pendingOutputStatusText": false,
+            "isStreaming": false,
+            "text": "我先按国内、国际、科技和财经四个板块筛选。",
+        });
+
+        assert_eq!(
+            dom_output_in_progress_reason(&data),
+            Some("assistant_message_not_committed")
+        );
+
+        let committed = json!({
+            "provisionalAssistantShell": false,
+            "composerVisible": true,
+            "composerDisabled": false,
+            "composerTextLength": 0,
+            "imageCount": 0,
+            "pendingOutputStatusText": false,
+            "isStreaming": false,
+            "text": "# 7 月 14 日晚间要闻\n\n完整正文",
+        });
+        assert_eq!(dom_output_in_progress_reason(&committed), None);
+    }
+
+    #[test]
+    fn dom_ready_signature_detects_equal_length_content_replacement() {
+        let waited = |text: &str| WaitedFinal {
+            final_message: json!({
+                "text": text,
+                "turnId": "assistant-message-1",
+                "source": "dom_fallback",
+                "imageCount": 0,
+            }),
+            summary: json!({"source": "dom_fallback_outcome"}),
+            all_texts: vec![text.to_string()],
+            had_429_or_fallback: true,
+        };
+
+        assert_ne!(
+            dom_ready_signature(&waited("ABCD")),
+            dom_ready_signature(&waited("WXYZ"))
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_final_resets_settle_for_equal_length_content_replacement() {
+        let waited = |text: &str| WaitedFinal {
+            final_message: json!({
+                "text": text,
+                "turnId": "assistant-message-1",
+                "source": "dom_fallback",
+                "imageCount": 0,
+            }),
+            summary: json!({"source": "dom_fallback_outcome"}),
+            all_texts: vec![text.to_string()],
+            had_429_or_fallback: true,
+        };
+        let conversation_id = "test-equal-length-settle";
+        set_test_dom_outcomes(
+            conversation_id,
+            vec![
+                DomExtractOutcome::Ready(waited("ABCD")),
+                DomExtractOutcome::Ready(waited("WXYZ")),
+                DomExtractOutcome::Ready(waited("WXYZ")),
+                DomExtractOutcome::Ready(waited("WXYZ")),
+                DomExtractOutcome::Ready(waited("WXYZ")),
+                DomExtractOutcome::Ready(waited("WXYZ")),
+                DomExtractOutcome::Ready(waited("WXYZ")),
+            ],
+        );
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = RuntimeConfig {
+            browser: super::super::BrowserConfig::default(),
+            chatgpt: super::super::ChatGptConfig::default(),
+            profile_dir: temp.path().join("profile"),
+            state_path: temp.path().join("auth-state.json"),
+            sessions_path: temp.path().join("sessions.json"),
+            attachments_dir: temp.path().join("attachments"),
+        };
+        let auth = AuthState {
+            captured_at: String::new(),
+            base_url: String::new(),
+            user_agent: String::new(),
+            captured_auth_headers: BTreeMap::new(),
+            captured_auth_identity: super::super::AuthorizationIdentity::default(),
+            captured_account_check: None,
+            cookies: Vec::new(),
+        };
+        let stop_marker = temp.path().join("stop");
+
+        let result = wait_final(
+            &config,
+            &auth,
+            conversation_id,
+            None,
+            WaitFinalOptions {
+                duration: std::time::Duration::from_secs(8),
+                stop_marker_path: &stop_marker,
+                profile_dir: Some(&config.profile_dir),
+                terminal_idle_stable_for: std::time::Duration::ZERO,
+            },
+        )
+        .await
+        .expect("settled final result");
+
+        while take_test_dom_outcome(conversation_id).is_some() {}
+        assert!(take_test_dom_outcome(conversation_id).is_none());
+
+        assert_eq!(
+            result.final_message.get("text").and_then(Value::as_str),
+            Some("WXYZ")
         );
     }
 

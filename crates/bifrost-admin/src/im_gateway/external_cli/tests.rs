@@ -361,6 +361,192 @@ fn codex_cli_parser_maps_real_command_execution_events() {
 }
 
 #[test]
+fn file_change_detail_counts_added_deleted_and_modified_lines() {
+    let detail = file_change_detail_from_value(&serde_json::json!({
+        "type": "fileChange",
+        "changes": [
+            {
+                "path": "src/updated.rs",
+                "kind": {"type": "update", "move_path": null},
+                "diff": "--- a/src/updated.rs\n+++ b/src/updated.rs\n@@ -1,2 +1,3 @@\n-old\n+new\n+extra\n context\n"
+            },
+            {
+                "path": "src/new.rs",
+                "kind": {"type": "add"},
+                "diff": "--- /dev/null\n+++ b/src/new.rs\n@@ -0,0 +1,2 @@\n+one\n+two\n"
+            },
+            {
+                "path": "src/old.rs",
+                "kind": {"type": "delete"},
+                "diff": "--- a/src/old.rs\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-one\n-two\n"
+            }
+        ]
+    }))
+    .expect("file change detail");
+
+    assert!(detail.contains("file: src/updated.rs (修改 1 行 · 新增 1 行)"));
+    assert!(detail.contains("file: src/new.rs (新增 2 行)"));
+    assert!(detail.contains("file: src/old.rs (删除 2 行)"));
+    assert!(!detail.contains("修改 2 行 · 新增 1 行 · 删除 1 行"));
+}
+
+#[test]
+fn file_change_detail_keeps_action_when_diff_has_no_changed_lines() {
+    let detail = file_change_detail_from_value(&serde_json::json!({
+        "path": "src/renamed.rs",
+        "status": "completed",
+        "kind": {"type": "move", "move_path": "src/original.rs"}
+    }))
+    .expect("file change detail");
+
+    assert_eq!(detail, "file: src/renamed.rs (移动)");
+}
+
+#[test]
+fn file_change_detail_counts_plain_added_and_deleted_content() {
+    let detail = file_change_detail_from_value(&serde_json::json!({
+        "type": "fileChange",
+        "changes": [
+            {
+                "path": "/workspace/src/new.rs",
+                "kind": {"type": "add"},
+                "diff": "first\n+literal content\n-third\n"
+            },
+            {
+                "path": "/workspace/src/old.rs",
+                "kind": {"type": "delete"},
+                "diff": "first\n\nthird\n"
+            }
+        ]
+    }))
+    .expect("file change detail");
+
+    assert!(detail.contains("file: /workspace/src/new.rs (新增 3 行)"));
+    assert!(detail.contains("file: /workspace/src/old.rs (删除 3 行)"));
+}
+
+#[test]
+fn file_change_detail_uses_workspace_relative_paths_and_indents_every_diff_line() {
+    let detail = file_change_detail_from_value_with_work_dir(
+        &serde_json::json!({
+            "type": "fileChange",
+            "changes": [{
+                "path": "/workspace/project/target/demo.txt",
+                "kind": {"type": "add"},
+                "diff": "first\nsecond\nthird\n"
+            }]
+        }),
+        Some(Path::new("/workspace/project")),
+    )
+    .expect("file change detail");
+
+    assert_eq!(
+        detail,
+        "changes:\n- file: target/demo.txt (新增 3 行)\n  first\n  second\n  third"
+    );
+}
+
+#[test]
+fn file_change_detail_preserves_paths_outside_workspace() {
+    let detail = file_change_detail_from_value_with_work_dir(
+        &serde_json::json!({
+            "type": "fileChange",
+            "changes": [{
+                "path": "/shared/demo.txt",
+                "kind": {"type": "add"},
+                "diff": "one\n"
+            }]
+        }),
+        Some(Path::new("/workspace/project")),
+    )
+    .expect("file change detail");
+
+    assert!(detail.contains("file: /shared/demo.txt (新增 1 行)"));
+}
+
+#[test]
+fn file_change_detail_preserves_unknown_actions_and_path_only_changes() {
+    let detail = file_change_detail_from_value(&serde_json::json!({
+        "changes": [
+            {"path": "scripts/tool.sh", "action": "chmod"},
+            {"path": "assets/empty.txt"}
+        ]
+    }))
+    .expect("file change detail");
+
+    assert!(detail.contains("file: scripts/tool.sh (chmod)"));
+    assert!(detail.contains("file: assets/empty.txt"));
+}
+
+#[test]
+fn file_change_line_stats_do_not_pair_changes_across_hunks() {
+    let diff = "@@ -1 +1 @@\n-old\n context\n@@ -8 +8,2 @@\n context\n+new\n";
+
+    assert_eq!(unified_diff_line_stats(diff), (1, 1, 0));
+}
+
+#[test]
+fn external_progress_result_prefers_file_detail_and_keeps_structured_fallbacks() {
+    let nested_file_change = ExternalCliProgressEvent {
+        event_type: ExternalCliProgressEventType::ToolFinished,
+        content: "stale absolute-path detail".to_string(),
+        title: Some("fileChange".to_string()),
+        raw: serde_json::json!({
+            "params": {
+                "item": {
+                    "type": "fileChange",
+                    "path": "/workspace/project/src/main.rs",
+                    "kind": {"type": "update"}
+                }
+            }
+        }),
+    };
+    assert_eq!(
+        external_progress_result_text(&nested_file_change, Some(Path::new("/workspace/project"))),
+        "file: src/main.rs (修改)"
+    );
+
+    let detail_free_file_change = ExternalCliProgressEvent {
+        event_type: ExternalCliProgressEventType::ToolFinished,
+        content: String::new(),
+        title: Some("fileChange".to_string()),
+        raw: serde_json::json!({"item": {"type": "fileChange"}}),
+    };
+    assert!(
+        external_progress_result_text(&detail_free_file_change, None)
+            .contains(r#""type": "fileChange""#)
+    );
+
+    let empty_regular_tool = ExternalCliProgressEvent {
+        event_type: ExternalCliProgressEventType::ToolFinished,
+        content: String::new(),
+        title: Some("exec_command".to_string()),
+        raw: serde_json::json!({}),
+    };
+    assert!(external_progress_result_text(&empty_regular_tool, None).is_empty());
+}
+
+#[test]
+fn file_change_detail_covers_top_level_diff_and_header_only_unified_diff() {
+    let detail = file_change_detail_from_value(&serde_json::json!({
+        "diff": "--- a/src/main.rs\n+++ b/src/main.rs\n-old\n+new\n"
+    }))
+    .expect("top-level diff detail");
+    assert_eq!(
+        detail,
+        "diff:\n  --- a/src/main.rs\n  +++ b/src/main.rs\n  -old\n  +new"
+    );
+    assert!(looks_like_unified_diff(
+        "--- a/src/main.rs\n+++ b/src/main.rs\n-old\n+new\n"
+    ));
+
+    assert_eq!(
+        format_file_change_path("src/main.rs", Some("修改"), Some("context only"), None),
+        "file: src/main.rs (修改)"
+    );
+}
+
+#[test]
 fn traex_cli_parser_maps_real_jsonl_events() {
     let stdout = r#"{"type":"thread.started","thread_id":"019e9f78-traex"}
 {"type":"turn.started"}
@@ -1191,6 +1377,8 @@ fn claude_code_adapter_applies_session_model_to_command_spec() {
 
     assert_eq!(spec.executable, "claude");
     assert!(spec.args.contains(&"-p".to_string()));
+    assert!(has_arg_pair(&spec.args, "--input-format", "stream-json"));
+    assert!(spec.args.contains(&"--replay-user-messages".to_string()));
     assert!(has_arg_pair(
         &spec.args,
         "--model",
@@ -1199,6 +1387,36 @@ fn claude_code_adapter_applies_session_model_to_command_spec() {
     assert!(spec
         .args
         .contains(&"--dangerously-skip-permissions".to_string()));
+}
+
+#[test]
+fn claude_code_explicit_exec_transport_keeps_text_stdin() {
+    let request = ExternalCliRunRequest {
+        images: Vec::new(),
+        message: "hello".to_string(),
+        operation: default_operation(),
+        params: serde_json::Value::Null,
+        provider_id: Some("provider-a".to_string()),
+        runner_id: Some(DEFAULT_CLAUDE_CODE_RUNNER_ID.to_string()),
+        session_key: Some("session:claude-exec".to_string()),
+        runtime: DEFAULT_RUNTIME.to_string(),
+        adapter: CLAUDE_CODE_ADAPTER.to_string(),
+        work_dir: Some(PathBuf::from("/tmp/work")),
+        instructions: None,
+        adapter_config: ExternalCliAdapterConfig {
+            transport: Some(ExternalCliTransport::Exec),
+            danger_full_access: Some(true),
+            ..Default::default()
+        },
+        allow_work_dirs: Vec::new(),
+        inject_bifrost_tools: false,
+        skill_paths: Vec::new(),
+    };
+
+    let spec = build_command_spec(&request, Path::new("/tmp/last.md")).unwrap();
+
+    assert!(has_arg_pair(&spec.args, "--input-format", "text"));
+    assert!(!spec.args.contains(&"--replay-user-messages".to_string()));
 }
 
 #[test]
@@ -1279,6 +1497,37 @@ async fn final_response_prefers_assistant_message_over_run_finished() {
 }
 
 #[tokio::test]
+async fn final_response_prefers_run_failed_message_over_protocol_stdout() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let events = vec![ExternalCliProgressEvent {
+        event_type: ExternalCliProgressEventType::RunFailed,
+        content: "request timed out".to_string(),
+        title: Some("Codex error".to_string()),
+        raw: serde_json::json!({"method":"error"}),
+    }];
+
+    let response = final_response(
+        &temp_dir.path().join("missing.md"),
+        r#"{"id":1,"result":{"userAgent":"Codex Desktop"}}"#,
+        &events,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response, "request timed out");
+}
+
+#[tokio::test]
+async fn final_response_falls_back_to_trimmed_stdout() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let response = final_response(&temp_dir.path().join("missing.md"), "  raw fallback  ", &[])
+        .await
+        .unwrap();
+
+    assert_eq!(response, "raw fallback");
+}
+
+#[tokio::test]
 async fn external_cli_runtime_runs_mock_command_and_writes_artifacts() {
     let temp_dir = tempfile::tempdir().unwrap();
     let runtime = ExternalCliRuntime::new(temp_dir.path());
@@ -1316,6 +1565,72 @@ async fn external_cli_runtime_runs_mock_command_and_writes_artifacts() {
     assert_eq!(result.events.len(), 2);
     assert!(Path::new(&result.artifacts.command_snapshot).exists());
     assert!(Path::new(&result.artifacts.normalized_events).exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn external_cli_runtime_dispatches_default_claude_stream_json_transport() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let executable = temp_dir.path().join("mock-claude-runtime");
+    std::fs::write(
+        &executable,
+        r#"#!/usr/bin/env python3
+import json
+import sys
+
+if "--version" in sys.argv:
+    print("mock claude 1.0")
+    raise SystemExit(0)
+
+first = json.loads(sys.stdin.readline())
+print(json.dumps({"type":"system","subtype":"init","session_id":"runtime-stream-session"}), flush=True)
+print(json.dumps(first), flush=True)
+print(json.dumps({"type":"assistant","message":{"content":[{"type":"text","text":"runtime stream final"}]},"session_id":"runtime-stream-session"}), flush=True)
+print(json.dumps({"type":"result","subtype":"success","is_error":False,"result":"runtime stream final","session_id":"runtime-stream-session"}), flush=True)
+"#,
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&executable, permissions).unwrap();
+
+    let runtime = ExternalCliRuntime::new(temp_dir.path().join("runs"));
+    let request = ExternalCliRunRequest {
+        images: Vec::new(),
+        message: "hello stream runtime".to_string(),
+        operation: default_operation(),
+        params: serde_json::Value::Null,
+        provider_id: Some("provider-a".to_string()),
+        runner_id: Some(DEFAULT_CLAUDE_CODE_RUNNER_ID.to_string()),
+        session_key: Some("runtime-stream-session-key".to_string()),
+        runtime: DEFAULT_RUNTIME.to_string(),
+        adapter: CLAUDE_CODE_ADAPTER.to_string(),
+        work_dir: None,
+        instructions: None,
+        adapter_config: ExternalCliAdapterConfig {
+            executable: Some(executable.display().to_string()),
+            // This is an integration-style process test that includes executable probing and
+            // Python startup. Keep enough scheduling headroom when the workspace suite is busy.
+            timeout_secs: Some(15),
+            ..Default::default()
+        },
+        allow_work_dirs: Vec::new(),
+        inject_bifrost_tools: false,
+        skill_paths: Vec::new(),
+    };
+
+    assert!(ExternalCliTransport::AppServer.supports_live_guide());
+    assert!(ExternalCliTransport::StreamJson.supports_live_guide());
+    assert!(!ExternalCliTransport::Exec.supports_live_guide());
+    let result = runtime.run(request).await.unwrap();
+    assert_eq!(result.status, ExternalCliRunStatus::Succeeded);
+    assert_eq!(result.response, "runtime stream final");
+    assert!(result
+        .events
+        .iter()
+        .any(|event| event.event_type == ExternalCliProgressEventType::AssistantFinal));
 }
 
 #[tokio::test]
@@ -2536,6 +2851,106 @@ fn codex_like_metadata_includes_turn_usage_tokens() {
 }
 
 #[test]
+fn codex_progress_metadata_merges_thread_total_and_weekly_window() {
+    let usage_event = ExternalCliProgressEvent {
+        event_type: ExternalCliProgressEventType::Status,
+        content: "token usage updated".to_string(),
+        title: Some("token_usage".to_string()),
+        raw: serde_json::json!({
+            "usage": {
+                "input_tokens": 1200,
+                "cached_input_tokens": 300,
+                "output_tokens": 80,
+                "reasoning_output_tokens": 20,
+                "total_tokens": 1280
+            }
+        }),
+    };
+    let limits_event = ExternalCliProgressEvent {
+        event_type: ExternalCliProgressEventType::Status,
+        content: "usage updated".to_string(),
+        title: Some("rate_limits".to_string()),
+        raw: serde_json::json!({
+            "params": {
+                "rateLimits": {
+                    "limitId": "codex",
+                    "primary": {
+                        "usedPercent": 63,
+                        "windowDurationMins": 10080,
+                        "resetsAt": 1784490086
+                    },
+                    "secondary": {
+                        "usedPercent": 5,
+                        "windowDurationMins": 300,
+                        "resetsAt": 1784000000
+                    }
+                }
+            }
+        }),
+    };
+    let mut metadata = std::collections::BTreeMap::new();
+
+    assert!(merge_external_cli_progress_metadata(
+        DEFAULT_ADAPTER,
+        &usage_event,
+        &mut metadata
+    ));
+    assert!(merge_external_cli_progress_metadata(
+        DEFAULT_ADAPTER,
+        &limits_event,
+        &mut metadata
+    ));
+
+    assert_eq!(
+        metadata.get("usageTotalTokens").map(String::as_str),
+        Some("1280")
+    );
+    assert_eq!(
+        metadata.get("codexWeeklyUsedPercent").map(String::as_str),
+        Some("63")
+    );
+    assert_eq!(
+        metadata.get("codexWeeklyWindowMinutes").map(String::as_str),
+        Some("10080")
+    );
+    assert_eq!(
+        metadata.get("codexWeeklyResetsAt").map(String::as_str),
+        Some("1784490086")
+    );
+}
+
+#[test]
+fn codex_progress_metadata_ignores_short_windows_and_non_codex_adapters() {
+    let event = ExternalCliProgressEvent {
+        event_type: ExternalCliProgressEventType::Status,
+        content: "usage updated".to_string(),
+        title: Some("rate_limits".to_string()),
+        raw: serde_json::json!({
+            "rateLimits": {
+                "primary": {
+                    "usedPercent": 20,
+                    "windowDurationMins": 300,
+                    "resetsAt": 1784000000
+                }
+            }
+        }),
+    };
+    let mut metadata = std::collections::BTreeMap::new();
+
+    assert!(!merge_external_cli_progress_metadata(
+        DEFAULT_ADAPTER,
+        &event,
+        &mut metadata
+    ));
+    assert!(!merge_external_cli_progress_metadata(
+        CLAUDE_CODE_ADAPTER,
+        &event,
+        &mut metadata
+    ));
+    assert!(metadata.is_empty());
+}
+
+#[test]
 fn codex_and_traex_metadata_include_runner_observability() {
     for adapter in [DEFAULT_ADAPTER, TRAEX_ADAPTER] {
         let request = ExternalCliRunRequest {
@@ -2572,6 +2987,17 @@ fn codex_and_traex_metadata_include_runner_observability() {
             timeout_secs: Some(30),
         };
         let events = vec![
+            ExternalCliProgressEvent {
+                event_type: ExternalCliProgressEventType::Status,
+                content: "retrying capacity error".to_string(),
+                title: Some("Codex capacity retry".to_string()),
+                raw: serde_json::json!({
+                    "type": "capacity_retry",
+                    "retryAttempt": 1,
+                    "maxRetries": 3,
+                    "delayMs": 1000
+                }),
+            },
             ExternalCliProgressEvent {
                 event_type: ExternalCliProgressEventType::ToolFinished,
                 content: "tool output".to_string(),
@@ -2650,6 +3076,10 @@ fn codex_and_traex_metadata_include_runner_observability() {
             Some(&"120".to_string())
         );
         assert_eq!(metadata.get("tools.count"), Some(&"1".to_string()));
+        assert_eq!(
+            metadata.get("runner.capacityRetryCount"),
+            Some(&"1".to_string())
+        );
         assert_eq!(
             metadata.get("tools.totalDurationMs"),
             Some(&"120".to_string())

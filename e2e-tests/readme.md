@@ -188,6 +188,7 @@ Admin API 测试脚本位于 `tests/` 目录，用于测试 Bifrost 的管理 AP
 | `test_cert_admin_api.sh`      | 7      | 证书信息、下载、二维码               |
 | `test_proxy_admin_api.sh`     | 6      | 系统代理状态、设置                   |
 | `test_system_admin_api.sh`    | 10     | 系统信息、概览、指标历史             |
+| `test_process_resolution_performance.sh` | 8 | 管理请求跳过进程识别、外部 Admin-like path 防误伤、诊断计数、主指标隔离、普通代理回归、并发连接共享 snapshot generation、有界缓存诊断与可选 18k 高基数真实连接压力 |
 | `test_scripts_admin_api.sh`   | 12     | 脚本 CRUD、列表、内置脚本            |
 | `test_replay_rules.sh`        | 28     | Replay custom rules、请求/响应修改矩阵 |
 | `test_site_docs_sync.sh`      | 1      | 文档站点同步完整性、未来新增 docs 文档自动生成、真实 VitePress 构建与静态首页覆盖 |
@@ -244,6 +245,18 @@ bash scripts/run_all_e2e.sh --ci --full-shell --skip-rules --skip-runner --skip-
 # 检查所有 e2e-tests/tests/test_*.sh 都已进入 CI shell job 或显式跳过
 bash scripts/ci/check-e2e-shell-ci-coverage.sh
 ```
+
+### 可审计能力与结果清单
+
+- `e2e-tests/capabilities.json` 是代理核心功能的机器可读能力矩阵；运行
+  `python3 scripts/ci/check-e2e-capabilities.py` 校验 P0 测试层、平台、失败模式和证据文件。
+- 统一入口结束时在 `$BIFROST_E2E_REPORT_DIR/summary.json` 生成机器可读结果，包含每个
+  suite 的状态、耗时、日志和跳过原因。CI 成功与失败都会上传该报告。
+- PR 的 Rust 新增/修改生产行由 `scripts/ci/coverage-diff.py` 执行 95% changed-lines
+  门禁，主 Coverage 以 proxy E2E 子集执行 `bifrost-proxy` production 90% 绝对门禁；
+  每周/手动任务额外生成 unit+integration、E2E-only、union 三层覆盖报告。
+- 完整 Playwright suite 由独立 `E2E UI (Playwright)` job 执行，不再依赖其他 Shell
+  测试间接覆盖管理端页面。
 
 ### Admin API 客户端工具
 

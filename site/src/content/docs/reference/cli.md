@@ -652,16 +652,16 @@ bifrost upgrade
 bifrost sync status
 bifrost login
 bifrost login --token "$BIFROST_SYNC_TOKEN"
-bifrost login --token "$BIFROST_SYNC_TOKEN" --url https://bifrost.bytedance.net
+bifrost login --token "$BIFROST_SYNC_TOKEN" --url https://sync.example.com
 bifrost sync login
 bifrost sync login --token "$BIFROST_SYNC_TOKEN"
-bifrost sync login --token "$BIFROST_SYNC_TOKEN" --url https://bifrost.bytedance.net
+bifrost sync login --token "$BIFROST_SYNC_TOKEN" --url https://sync.example.com
 bifrost sync logout
 bifrost sync run
 bifrost sync config --enabled true --auto-sync true --remote-url https://example.com
 ```
 
-`bifrost login` 与 `bifrost sync login` 等价，用于更直接地表达登录动作。Headless/CI 登录 token 可从 `https://bifrost.bytedance.net/v4/sso/token-login` 获取；省略 `--url` 时使用当前同步配置的远端 URL，默认是内置 Bifrost Provider。
+`bifrost login` 与 `bifrost sync login` 等价，用于更直接地表达登录动作。运行 `bifrost login --help` 可查看当前内置 Provider 的 Headless/CI token 获取地址；省略 `--url` 时使用当前同步配置的远端 URL，默认是内置 Bifrost Provider。
 
 ### 本机 remote-invoke 设置（setting）
 
@@ -748,7 +748,7 @@ bifrost remote keep-awake mode get
 
 ```bash
 export BIFROST_REMOTE_CLIENT_ID=devbox
-bifrost remote file read go.mod --cwd /repo
+bifrost remote file read Cargo.toml --cwd /repo
 bifrost remote --client-id macbook exec --detach --shell-text "python3 check.py"
 bifrost remote --client-id macbook job watch <call_id> --output-file ./check.log
 ```
@@ -812,9 +812,7 @@ Runner 选择规则：交互式终端中未传 `--runner` 时会展示启用 Run
 
 需要 provider 的 IM 命令都支持 `--provider <id>` 显式指定。未提供 `--provider` 时，CLI 会复用统一选择逻辑：只有一个 enabled provider 时自动选择；多个 enabled provider 且处于交互式终端时展示列表让用户选择；多个 provider 且 stdin 非交互时会要求显式传 `--provider`。`bifrost im send` 未传 `--target` 时默认发送给所选 provider 的 owner，因此 provider 需要配置 `owner_open_id`（可在创建时用 `--owner-open-id`，或由后端连接飞书后自动检测）。
 
-IM 通道建立后，Bifrost 会先推送上线通知和可用命令帮助。帮助内容会按当前绑定 Runner 过滤：所有 Runner 都显示 `/help`、`/status`、`/cwd`、`/runner`、`/q`、`/rq`、`/stop` 等 IM 通道命令；内置 Bifrost Agent 才显示 `/remember`、`/memories`、`/forget`、`/compact`、`/goal`、`/g` 等内置 Agent 命令；Codex / Traex / Claude Code 等外部 Runner 只在适配器支持时显示 `/models`、`/model`、`/efforts`、`/effort`。
-
-Agent 配置支持 `default_message_channel`，用于给 turn 级 `send_msg` 工具和 Agent 创建的 schedule 提供默认 IM 发送目标。手动创建 schedule 时仍应显式绑定目标（例如 `--target oncall`，或 API 的 `message_channel`），避免任务执行时把通知发到最近一次对话；通过 IM 消息触发的 Agent 创建 schedule 时会自动继承当前来源通道，通过 `/agent/chat` 创建时会回退到 `default_message_channel`。
+IM 通道建立后，Bifrost 会先推送上线通知和可用命令帮助。所有外部 Runner 都显示 `/help`、`/status`、`/cwd`、`/runner`、`/q`、`/rq`、`/stop` 等 IM 通道命令；Codex / Traex / Claude Code 等 Runner 只在适配器支持时显示 `/models`、`/model`、`/efforts`、`/effort`。
 
 `bifrost im schedule add/update` 创建 Agent schedule 时可用 `--agent-runner-id` 选择 Runner，并通过 `--agent-model`、`--agent-profile`、`--agent-profile-v2`、`--agent-sandbox`、`--agent-reasoning-effort`、`--agent-reasoning-summary`、`--agent-approval-policy`、`--agent-danger-full-access`、`--agent-bypass-hook-trust`、`--agent-skip-git-repo-check`、`--agent-ignore-user-config`、`--agent-ignore-rules`、`--agent-add-dir`、`--agent-config`、`--agent-enable`、`--agent-disable` 等参数写入 `agent.adapter_config`。这些 schedule 级参数会在运行时覆盖 Runner 默认 Codex adapter 配置；历史 `--agent-search` 仅作为兼容入口映射为 `--enable web_search`，不再生成当前 Codex CLI 不支持的 `--search`。
 

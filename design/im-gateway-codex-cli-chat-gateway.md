@@ -25,7 +25,6 @@ Chat Gateway 不是新的 Agent 产品形态，也不是绕过 IM Gateway 的快
 - 不把测试请求中的任意 work_dir 直接放开到外部 CLI Agent；必须经过 allowlist 或配置解析。
 - 不让 Chat Gateway 和 IM Gateway 各自实现两套 message sanitizer、progress renderer 或 session queue。
 - 不把 secret、provider token、完整 provider config 暴露到 Chat Gateway 响应。
-- 已有内置 Bifrost Agent runtime 继续可选；`AgentConfig.runner=bifrost_agent` 保持默认可选值。
 
 ### 必须真实验证
 
@@ -80,6 +79,16 @@ trait ExternalCliAgentAdapter {
 
 Codex 归一化：`command_execution` → `ToolStarted`/`ToolFinished`，tool name `exec_command`，arguments 用 `item.command`，result 用 `item.aggregated_output`，success 用 `item.exit_code == 0`，call id 用 `item.id`。Claude Code stream-json 的 `tool_use` 与 `tool_result` 按 `tool_use_id` 成对归一化，Bash 工具优先展示 `input.command` 与 `tool_use_result.stdout/stderr`。
 
+### Codex app-server 可重试错误
+
+Codex app-server 的 `error` notification 同时承载“最终失败”和“上游流短暂断开、Runner 将自动重试”两种语义。Bifrost 必须读取 `params.willRetry`：
+
+- `willRetry: true` 归一化为普通 `Status`，保留重连提示，但继续等待同一个 turn 的后续事件。
+- `willRetry: false` 或缺失时归一化为 `RunFailed`，结束本次 turn。
+- 失败且没有 assistant final 时，用户可见回复优先采用最后一个 `RunFailed` 的错误信息；JSON-RPC 初始化、thread resume、MCP 启动状态等原始 stdout 只作为 artifact 保存，不得直接发送到 IM。
+
+这样既保留 Codex 自身的重试能力，也避免瞬时网络抖动被 Bifrost 提前放大成终止失败。
+
 ### 完成状态权威来源
 
 外部 CLI stdout JSONL 是过程流，不等同于最终可见答案已持久化。顺序必须遵守：
@@ -92,13 +101,30 @@ Codex 归一化：`command_execution` → `ToolStarted`/`ToolFinished`，tool na
 
 回归测试必须覆盖 stdout `turn.completed` 早于最终 response 的场景。
 
+### App-server 容量错误自动恢复
+
+Codex/Trae app-server 可能在 turn 尚未开始实际工作时返回
+`codexErrorInfo=serverOverloaded`，并同时声明 `willRetry=false`。External Runner
+不能把这种瞬时容量抖动直接暴露为最终失败，应在同一个 app-server 进程、同一个
+thread 内重新发起 turn：
+
+- 最多自动重试 3 次，退避为 1s、2s、4s；总 turn timeout 继续生效。
+- 初次 turn 与重试 turn 复用同一个 `clientUserMessageId`，标识为同一条用户输入。
+- 重试过程输出 canonical `Status` 事件，原始容量错误不输出 `RunFailed`；run
+  metadata 记录 `runner.capacityRetryCount`。
+- 只认结构化 `codexErrorInfo=serverOverloaded`，认证、参数、模型不存在等错误立即失败。
+- 一旦本轮已产生 assistant 内容、工具调用或存在待确认 guide，禁止自动重试，
+  避免重复执行有副作用的操作。
+- `/stop` 在退避等待期间仍立即生效；重试后的 active guide handle 必须切换到新的 turn id。
+- 3 次重试仍失败时，保留最后一次原始错误并正常收敛为 failed。
+
 ### 外部 Runner 状态展示
 
-外部 CLI runner 不能照搬内置 Agent 的 loop/context/compaction 指标。飞书 progress card 与 Web Chat 显示：
+外部 CLI runner 的飞书 progress card 与 Web Chat 显示：
 
 - 状态标题：`Runner` 和模型标签；配置了 `adapterConfig.model` 时展示真实模型名和来源。
 - 状态正文：运行状态、Runner、Adapter、模型、外部会话、队列/引导、工作路径、最新工具摘要、token usage、最近输入 context（来自 `turn.completed.usage.input_tokens` 近似值）。
-- 不展示内置 Agent 专属的 `Loop 0/0`、`压缩 0 次` 空指标；未知字段保持 N/A。
+- 不展示没有外部 runner 数据来源的 `Loop 0/0`、`压缩 0 次` 空指标；未知字段保持 N/A。
 - 隐藏 chain-of-thought 不可见，也不伪造；只展示 CLI 明确输出的 reasoning summary / status / tool / final。
 
 ### 图片附件桥接
@@ -159,7 +185,6 @@ adapter 声明能力，WebUI/API 按能力显隐配置项：
 | `mcp_servers` | 按 server name 合并；secret/env 来自安全存储 |
 | `reply_mode=real_im` | 必须 global 允许 + channel 允许 + request 显式 + 权限校验 |
 
-`AgentConfig.runner` 与 `ImProviderAgentConfig.runner` 使用统一 runner 语义：`bifrost_agent` 表示内置 Agent，自定义 runner 直接保存 runner ID（`Codex`、`Claude-Code`、`abc` 等）。
 
 ### Codex adapter 参数映射
 
@@ -193,7 +218,7 @@ $BIFROST_DATA_DIR/im_gateway/chat_runs/<run_id>/
 
 ### 会话状态持久化与默认续接
 
-`session_state.json` 按 `sessionKey + adapter + runnerId` scope 保存 threadId 与 modelOverride，用于跨轮 resume。Codex/Traex app-server 运行中通过 `turn/steer` 接收 Guide；Claude Code 与自定义/exec transport 先请求 active worker capability，无法注入时完整降级 queue。只有 `/q` 始终显式排队，ChatGPT Web 保持默认 queue；`/stop` 映射到 active runner 进程并终止其独立进程组。
+`session_state.json` 按 `sessionKey + adapter + runnerId` scope 保存 threadId 与 modelOverride，用于跨轮 resume。运行中收到的普通后续消息默认进入 FIFO queue，当前 turn 完成后作为独立下一轮执行；`/q` 继续提供显式排队与序号管理。只有显式 `/g` 才尝试运行中引导：Codex/Traex app-server 通过 `turn/steer` 接收 Guide，Claude Code 与自定义/exec transport 先请求 active worker capability，无法注入时完整降级 queue。ChatGPT Web 不提供 `/g`；`/stop` 映射到 active runner 进程并终止其独立进程组。
 
 ## CLI + Web + Admin API
 
@@ -248,6 +273,8 @@ $BIFROST_DATA_DIR/im_gateway/chat_runs/<run_id>/
 - `chat_gateway_real_im_requires_permission`；`agent_effective_config_marks_inherited_and_overridden_fields`；`agent_effective_config_rejects_channel_work_dir_expansion`。
 - `request_run_stop_treats_missing_active_pid_as_stopped`；`taskkill_missing_process_messages_are_idempotent`。
 - `external_cli_images_from_chat_images_preserves_payloads`；`session_attachment_base_dir_uses_history_file_stem`；`external_cli_run_writes_image_attachments_and_injects_prompt_paths`。
+- `app_server_retryable_errors_remain_non_terminal`：覆盖 `willRetry=true` 为 `Status`、最终 error 为 `RunFailed`。
+- `final_response_prefers_run_failed_message_over_protocol_stdout`：失败且无 assistant final 时不把 app-server JSON-RPC stdout 暴露给用户。
 
 ### E2E 测试
 
@@ -256,6 +283,7 @@ $BIFROST_DATA_DIR/im_gateway/chat_runs/<run_id>/
 - `test_im_gateway_codex_runner_streaming.sh`：真实 Codex CLI 触发 `pwd`，断言 `tool_started` 早于 `run_finished`。
 - `im_gateway_agent_config_webui_flow` / `_theme`。
 - `im_gateway_external_runner_image_input` / `_im_images`。
+- `test_im_gateway_codex_retryable_error.sh`：mock app-server 先发送 `willRetry=true` error，再发送 assistant final 与 `turn/completed`；断言 run 成功、重连事件为 `status`、无 `run_failed`、回复不含握手 JSON。
 
 ### 真实场景测试
 

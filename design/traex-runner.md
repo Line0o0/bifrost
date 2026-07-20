@@ -89,7 +89,9 @@ Web Chat 和 IM event loop 使用 `record_external_cli_progress_event_to_timelin
 - `ToolFinished` 写入 tool call + tool result,优先使用 Trae 原始事件中的 call id、tool name、arguments。
 - `AssistantFinal` 在 runner 仍运行时写入过程 timeline,作为 Trae/Codex 公开的模型 content 展示;底部最终回答仍由 run result/turn finish 统一记录为 assistant message。
 
-前端 `ProcessStepsBlock` 运行中默认展开,完成后默认折叠。运行中按实时 conversation timeline 从上到下展示模型公开 content 和工具调用;模型公开 content 直接展示原文,不额外添加 `1.` / `2.` 这类序号。工具行默认只展示可读命令标题,点击后展开输入/输出详情。`run_state_changed` 仍是后端判定 running/completed 的内部事实源,但不渲染成 `Run state: Running` 这类用户可见过程项;UI 顶部状态标签和 thread summary 才负责表达整体状态。飞书 progress card 会把连续工具调用折叠成 "已运行 N 条命令" 的一级分组,展开后再显示单条工具详情折叠项。噪音状态(run id、turn started/completed、model rerouted)不进入过程列表,避免卡片顶部被内部事件淹没。
+前端 `ProcessStepsBlock` 运行中默认展开,完成后默认折叠。运行中按实时 conversation timeline 从上到下展示模型公开 content 和工具调用;模型公开 content 直接展示原文,不额外添加 `1.` / `2.` 这类序号。工具行默认只展示可读命令标题,点击后展开输入/输出详情。`run_state_changed` 仍是后端判定 running/completed 的内部事实源,但不渲染成 `Run state: Running` 这类用户可见过程项;UI 顶部状态标签和 thread summary 才负责表达整体状态。飞书 progress card 会把连续工具调用折叠成“已执行 N 个步骤”的一级分组,展开后再显示单条工具详情折叠项。噪音状态(run id、turn started/completed、model rerouted)不进入过程列表,避免卡片顶部被内部事件淹没。
+
+Codex app-server 的 `fileChange` 完成事件必须从 `params.item.changes[]` 提取文件路径、`kind.type` 和 diff；展开工具详情按文件展示新增、删除和修改行数，并保留 diff 作为核验依据。app-server 对新增或删除文件可能只返回不带 `+` / `-` 的正文，此时按 `kind.type` 和正文逻辑行数兜底统计。卡片使用 Runner 的真实 `work_dir` 把工作区内绝对路径显示为相对路径，多行详情逐行缩进；artifact 仍保留原始事件。工具标题显示为“文件变更”，执行过程按“已执行 N 个步骤”计数，避免把文件编辑误称为命令。只有事件本身确实没有结构化内容时才显示“暂无工具详情”，不能因为 `result` 字段为空而丢弃 `changes[]`。
 
 Web timeline 会按 `call_id` 合并工具 start/result,并跳过重复 start。后端在写 conversation timeline 时也会跳过同一 `call_id` 的重复 `ToolStarted`,避免 Trae/Codex 重复输出 `item.started` 时造成 WebView active command 计数虚高。
 
@@ -97,9 +99,8 @@ Web timeline 会按 `call_id` 合并工具 start/result,并跳过重复 start。
 
 运行中的 Web Chat 不使用前端定时轮询作为状态源。后端每次向 conversation timeline 写入外部 runner 事件后,通过已有 `sessions/events` SSE 推送轻量 `timeline_changed`,payload 只包含 `sessionKey`、`historyPath` 和可用的 `endIndex`。前端只接受当前打开的 `historyPath/sessionKey` 对应事件,多个线程同时运行时不会互相写入消息区;收到事件后按本地 `endIndex` 调用 history `since` 增量接口补齐。EventSource 连接不跟随普通 thread summary 刷新重建,而是通过 ref 读取当前线程和运行状态,避免多线程同时推送时发生连接抖动或旧响应覆盖。只有 SSE lagged、重连或返回的 `start_index` 与本地 `endIndex` 不连续时,才触发一次 tail/history 或 sessions/all 校准,避免运行页把 `/sessions/all` 变成高频心跳并拖高主进程 CPU。
 
-外部 runner (Codex/Trae) 使用 app-server transport 时支持 `turn/steer`: 同 session 的普通 busy 文本默认请求 Guide,Web Chat 展示 Guide/Queue 且默认选中 Guide;只有 `/q` 或 UI 选择 Queue 才直接进入 `SessionQueueManager`。不支持 live guide、runner 拒绝、控制通道失败或图片输入时必须明确降级排队并保留原消息/附件;成功 steer 的消息不得重复排队。`/stop` 仍作为单独控制命令立即尝试停止当前外部进程。当前 run 结束后,IM/Web Chat runner loop 只弹出显式排队或降级排队的消息启动下一轮,Codex 和 Trae 都复用上一轮保存的 `threadId` 续接 runner 原生会话上下文。ChatGPT Web 保持只支持 Queue。
+外部 runner (Codex/Trae) 使用 app-server transport 时支持 `turn/steer`: Web Chat 展示 Guide/Queue 且默认选中 Guide；IM 普通 busy 文本默认直接进入 `SessionQueueManager`，只有显式 `/g` 才请求 Guide。不支持 live guide、runner 拒绝或控制通道失败时，显式 Guide 必须明确降级排队并保留原消息；普通文本和图片按默认队列保留完整消息/附件。成功 steer 的消息不得重复排队。`/stop` 仍作为单独控制命令立即尝试停止当前外部进程。当前 run 结束后，IM/Web Chat runner loop 弹出排队消息启动下一轮，Codex 和 Trae 都复用上一轮保存的 `threadId` 续接 runner 原生会话上下文。ChatGPT Web 保持只支持 Queue。
 
-Agent Chat 右侧 Threads 列表支持折叠: 卡片标题右侧按钮向右收起,收起后只保留右上悬浮向左展开按钮,状态写入 `localStorage`,刷新页面后保持。Threads runner 标记优先使用 `runner_id`/`runner_type`/`agent_type`,缺失时才从 `source`/`title` fallback 识别 Trae/Codex/ChatGPT,避免 Trae 会话误显示为 `Bf`。历史 JSONL 摘要和 session detail API 都必须保留 external runner metadata;服务重启后继续同一个 session 时,以绑定的 runner/thread/conversation 为准续接,无法恢复原生 thread 时才显式降级为同 runner 的新 thread,不能静默退回内置 Bifrost Agent。
 
 Runners 配置页的 Adapter 下拉只展示产品化入口: Codex CLI、Trae CLI、ChatGPT Web。后端仍接受历史或测试用途的 `custom`/`mock` adapter,保证已有配置和自动化测试不被破坏,但新建/编辑弹窗不再把这些未来扩展项暴露给普通用户。
 
@@ -112,7 +113,7 @@ Bifrost 使用 `traecli exec --json ... -` 的一轮一进程模式,不依赖 Tr
 - `/model <slug>`: 先用 `debug models` catalog 校验 slug;不存在时返回可见拒绝消息且不写入 override。存在时把 `<slug>` 写入 `session_state.json` 的 `modelOverride`,来源为 `session slash command`。后续同 session 同 runner 的 Codex/Traex run 在 Web Chat、runner-call 和 IM event loop 中合并为 `adapterConfig.model`,最终由 command spec 追加 `--model <slug>`,包括 `exec resume`。
 - `/model clear`: 删除 session override,让下一轮回到 runner 配置或 Traex 默认模型。
 
-Web UI 在当前 runner adapter 为 `codex` 或 `traex` 时展示 `/models` 和 `/model`。`/models` 在补全菜单中回车会直接发送;`/model` 回车或 Tab 会补齐命令并把光标放到末尾,方便继续输入模型 slug。IM 通道空闲时支持同一命令,运行中发送 `/model` 只提示等待当前任务结束,避免把控制命令当普通 prompt 送入 Codex/Traex。Slash 命令结果作为 display-only system message 写入 `session_state.json` 供刷新回放;即使该会话已有 canonical JSONL timeline,session detail 也必须把这些 system display messages 合并到返回的 `messages` 中,并保持为独立居中系统行。该消息不注入 runner prompt,避免污染模型上下文。
+Web UI 在当前 runner adapter 为 `codex` 或 `traex` 时展示 `/models` 和 `/model`。`/models` 在补全菜单中回车会直接发送;`/model` 回车或 Tab 会补齐命令并把光标放到末尾,方便继续输入模型 slug。IM 通道空闲时支持同一命令,运行中发送 `/model` 只提示等待当前任务结束,避免把控制命令当普通 prompt 送入 Codex/Traex。`/efforts` 与 `/effort` 在 busy 状态也必须由 Bifrost 命令层优先处理；设置只影响下一轮，不能经默认 Guide 进入当前 `turn/steer`。Slash 命令结果作为 display-only system message 写入 `session_state.json` 供刷新回放;即使该会话已有 canonical JSONL timeline,session detail 也必须把这些 system display messages 合并到返回的 `messages` 中,并保持为独立居中系统行。该消息不注入 runner prompt,避免污染模型上下文。
 
 Agent Chat 底部 token HUD 需要从 session detail、history summary 和外部 runner metadata 合并 `model`、`modelProvider`、`usageTotalTokens`、`usageInputTokens`。刷新页面、加载 history、发送下一轮消息以及运行中的 status 空快照都不能把已知模型、token 和 context 覆盖为空或 0。
 
@@ -199,7 +200,6 @@ Agent Chat 底部 token HUD 需要从 session detail、history summary 和外部
 - `e2e-tests/tests/test_im_gateway_traex_model_slash.sh`: 覆盖 `/models`、`/model <slug>`、`/model clear`。
 - `e2e-tests/tests/test_im_gateway_external_runner_delayed_final_state.sh`: 覆盖延迟 final state 的收敛。
 - `e2e-tests/tests/test_im_gateway_external_runner_image_input.sh`: 覆盖图像输入的 progress 语义。
-- `crates/bifrost-e2e/src/tests/im_gateway_agent.rs`: 覆盖 IM gateway + external CLI runner。
 - 使用临时 `BIFROST_DATA_DIR`、非 9900 端口,启动服务后调用 `/chat/stream`,断言 NDJSON 中包含 Trae progress event、最终 `run_finished`、run detail artifacts 和 timeline。
 - Playwright 断言 external runner 运行中输入只显示 Queue 并发送 `/q ...`;断言 Threads 折叠状态写入 localStorage,刷新后仍保持;断言 Trae fallback thread mark 不显示为 `Bf`;断言运行中 history 由 `timeline_changed` SSE 触发增量更新,其他线程的 timeline 事件不会污染当前消息区,且不会高频请求 `/sessions/all`。
 - Playwright 打开 Agent Runners 的 Add Runner 弹窗,断言 Adapter 下拉包含 Codex CLI、Trae CLI、ChatGPT Web,且不包含 Custom、Mock。

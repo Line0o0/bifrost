@@ -33,8 +33,9 @@ use crate::server::{
 };
 use crate::utils::logging::RequestContext;
 use crate::utils::process_info::{
-    app_policy_process_resolution_retry_config, resolve_client_process_async_for_connection,
-    resolve_client_process_async_for_connection_with_retry,
+    app_policy_process_resolution_retry_config, resolve_client_process_async_for_connection_shared,
+    resolve_client_process_async_for_connection_with_retry_shared, ClientProcess,
+    ConnectionProcessState,
 };
 use crate::utils::tee::store_request_body;
 use bifrost_core::{AccessControlConfig, AccessDecision, AccessMode, ClientAccessControl};
@@ -634,6 +635,7 @@ pub struct SocksHandler {
     inject_bifrost_badge: bool,
     proxy_auth_rate_limiter: Option<Arc<ProxyAuthRateLimiter>>,
     authenticated_account_name: Option<String>,
+    client_process_state: Arc<ConnectionProcessState>,
 }
 
 impl SocksHandler {
@@ -667,7 +669,38 @@ impl SocksHandler {
             inject_bifrost_badge: true,
             proxy_auth_rate_limiter: None,
             authenticated_account_name: None,
+            client_process_state: Arc::new(ConnectionProcessState::default()),
         }
+    }
+
+    async fn resolve_client_process(&self) -> Option<Arc<ClientProcess>> {
+        self.client_process_state
+            .resolve(|| async {
+                resolve_client_process_async_for_connection_shared(
+                    &self.peer_addr,
+                    &self.local_addr,
+                )
+                .await
+            })
+            .await
+    }
+
+    async fn resolve_client_process_with_retry(
+        &self,
+        max_retries: u32,
+        delay_ms: u64,
+    ) -> Option<Arc<ClientProcess>> {
+        self.client_process_state
+            .resolve(|| async {
+                resolve_client_process_async_for_connection_with_retry_shared(
+                    &self.peer_addr,
+                    &self.local_addr,
+                    max_retries,
+                    delay_ms,
+                )
+                .await
+            })
+            .await
     }
 
     fn stream(&mut self) -> &mut TcpStream {
@@ -1298,19 +1331,10 @@ impl SocksHandler {
                                     delay_ms,
                                     "SOCKS5 request requires synchronous client process resolution for app policy"
                                 );
-                                resolve_client_process_async_for_connection_with_retry(
-                                    &self.peer_addr,
-                                    &self.local_addr,
-                                    max_retries,
-                                    delay_ms,
-                                )
-                                .await
+                                self.resolve_client_process_with_retry(max_retries, delay_ms)
+                                    .await
                             } else {
-                                resolve_client_process_async_for_connection(
-                                    &self.peer_addr,
-                                    &self.local_addr,
-                                )
-                                .await
+                                self.resolve_client_process().await
                             };
                             let client_app = client_process.as_ref().map(|p| p.name.as_str());
 
@@ -1428,8 +1452,7 @@ impl SocksHandler {
 
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
 
-        let client_process =
-            resolve_client_process_async_for_connection(&peer_addr, &self.local_addr).await;
+        let client_process = self.resolve_client_process().await;
         let (client_app, client_pid, client_path) = client_process
             .as_ref()
             .map(|p| (Some(p.name.clone()), Some(p.pid), p.path.clone()))
@@ -1670,8 +1693,7 @@ impl SocksHandler {
 
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
 
-        let client_process =
-            resolve_client_process_async_for_connection(&self.peer_addr, &self.local_addr).await;
+        let client_process = self.resolve_client_process().await;
         let client_app = client_process.as_ref().map(|p| p.name.clone());
 
         if let Some(ref state) = admin_state {
@@ -1725,6 +1747,7 @@ impl SocksHandler {
             64 * 1024
         };
         let local_addr = self.local_addr;
+        let client_process_state = Arc::clone(&self.client_process_state);
         let inject_bifrost_badge = self.inject_bifrost_badge;
         let account_name = self.authenticated_account_name.clone();
 
@@ -1735,6 +1758,7 @@ impl SocksHandler {
             let admin_state = admin_state_for_service.clone();
             let dns_resolver = dns_resolver.clone();
             let account_name = account_name.clone();
+            let client_process_state = Arc::clone(&client_process_state);
             async move {
                 handle_socks5_intercepted_request(
                     req,
@@ -1752,6 +1776,7 @@ impl SocksHandler {
                     peer_addr,
                     local_addr,
                     account_name,
+                    client_process_state,
                 )
                 .await
             }
@@ -1862,8 +1887,7 @@ impl SocksHandler {
 
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
 
-        let client_process =
-            resolve_client_process_async_for_connection(&peer_addr, &self.local_addr).await;
+        let client_process = self.resolve_client_process().await;
         let (client_app, client_pid, client_path) = client_process
             .as_ref()
             .map(|p| (Some(p.name.clone()), Some(p.pid), p.path.clone()))
@@ -2087,6 +2111,7 @@ async fn handle_socks5_intercepted_request(
     peer_addr: SocketAddr,
     local_addr: SocketAddr,
     account_name: Option<String>,
+    client_process_state: Arc<ConnectionProcessState>,
 ) -> std::result::Result<Response<BoxBody>, hyper::Error> {
     let method = req.method().to_string();
     let original_uri = req.uri().clone();
@@ -2161,7 +2186,11 @@ async fn handle_socks5_intercepted_request(
     let mut new_req = Request::from_parts(parts, body);
     *new_req.uri_mut() = new_uri;
 
-    let client_process = resolve_client_process_async_for_connection(&peer_addr, &local_addr).await;
+    let client_process = client_process_state
+        .resolve(|| async {
+            resolve_client_process_async_for_connection_shared(&peer_addr, &local_addr).await
+        })
+        .await;
     let (client_app, client_pid, client_path) = client_process
         .as_ref()
         .map(|p| (Some(p.name.clone()), Some(p.pid), p.path.clone()))
@@ -2346,6 +2375,17 @@ mod tests {
             !server.unsafe_ssl(),
             "SocksServer should default to unsafe_ssl=false for security"
         );
+    }
+
+    #[tokio::test]
+    async fn coverage_90_server_accessors_expose_access_control_and_udp_address() {
+        let server = SocksServer::new(SocksConfig::default());
+        let access = Arc::clone(server.access_control());
+        assert!(Arc::ptr_eq(&access, server.access_control()));
+        assert_eq!(server.get_udp_relay_addr().await, None);
+        let address: SocketAddr = "127.0.0.1:19080".parse().unwrap();
+        *server.udp_relay_addr.write().await = Some(address);
+        assert_eq!(server.get_udp_relay_addr().await, Some(address));
     }
 
     #[test]
@@ -2719,6 +2759,22 @@ mod coverage_boost {
             None,
         );
         (handler, client)
+    }
+
+    #[tokio::test]
+    async fn socks_handler_reuses_one_connection_owned_process_arc() {
+        let (handler, _client) = make_handler(false, None, None).await;
+        let expected = Arc::new(ClientProcess {
+            pid: 4242,
+            name: "SOCKS Browser".to_string(),
+            path: Some("/Applications/SOCKS Browser.app".to_string()),
+        });
+        handler.client_process_state.store(Arc::clone(&expected));
+
+        let first = handler.resolve_client_process().await.unwrap();
+        let second = handler.resolve_client_process().await.unwrap();
+        assert!(Arc::ptr_eq(&expected, &first));
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]
@@ -3201,6 +3257,101 @@ mod coverage_boost_v2 {
             udp_relay_addr,
         );
         (handler, client)
+    }
+
+    #[tokio::test]
+    async fn coverage_90_full_handshake_rejects_bind_command() {
+        let (mut handler, mut client) = make_handler_with_opts(false, None, None, 30, None).await;
+        let server_task = tokio::spawn(async move { handler.handle_client().await });
+        client
+            .write_all(&[SOCKS5_VERSION, 1, AuthMethod::NoAuth as u8])
+            .await
+            .unwrap();
+        let mut auth = [0_u8; 2];
+        client.read_exact(&mut auth).await.unwrap();
+        assert_eq!(auth, [SOCKS5_VERSION, AuthMethod::NoAuth as u8]);
+        client
+            .write_all(&[
+                SOCKS5_VERSION,
+                SocksCommand::Bind as u8,
+                0,
+                AddressType::IPv4 as u8,
+                127,
+                0,
+                0,
+                1,
+                0,
+                80,
+            ])
+            .await
+            .unwrap();
+        let mut reply = [0_u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], SocksReply::CommandNotSupported as u8);
+        assert!(server_task
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("BIND"));
+    }
+
+    #[tokio::test]
+    async fn coverage_90_connect_failure_returns_specific_reply_and_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable = listener.local_addr().unwrap();
+        drop(listener);
+        let (mut handler, mut client) = make_handler_with_opts(false, None, None, 30, None).await;
+        let server_task = tokio::spawn(async move {
+            handler
+                .connect_and_relay(SocksAddress::IPv4(Ipv4Addr::LOCALHOST), unavailable.port())
+                .await
+        });
+        let mut reply = [0_u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], SocksReply::ConnectionRefused as u8);
+        let error = server_task.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("Failed to connect"));
+    }
+
+    #[tokio::test]
+    async fn relay_raw_forwards_both_directions_and_records_totals() {
+        let (mut handler, mut client_peer) =
+            make_handler_with_opts(false, None, None, 30, None).await;
+        let harness = bifrost_admin::test_support::TestAdminState::builder()
+            .port(19457)
+            .build();
+        handler.admin_state = Some(harness.state());
+        handler.authenticated_account_name = Some("coverage-account".to_string());
+
+        let (target_stream, mut target_peer, _) = make_connected_pair().await;
+        let task =
+            tokio::spawn(async move { handler.relay_raw(target_stream, "relay.test", 8080).await });
+
+        client_peer.write_all(b"client-to-target").await.unwrap();
+        let mut target_received = [0_u8; 16];
+        target_peer.read_exact(&mut target_received).await.unwrap();
+        assert_eq!(&target_received, b"client-to-target");
+
+        target_peer.write_all(b"target-to-client").await.unwrap();
+        let mut client_received = [0_u8; 16];
+        client_peer.read_exact(&mut client_received).await.unwrap();
+        assert_eq!(&client_received, b"target-to-client");
+
+        client_peer.shutdown().await.unwrap();
+        target_peer.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
+
+        let record = harness
+            .traffic_db
+            .query_latest_window(10)
+            .records
+            .into_iter()
+            .find(|record| record.h == "relay.test")
+            .expect("SOCKS relay traffic record");
+        assert_eq!(record.up, 16);
+        assert_eq!(record.down, 16);
+        assert_eq!(record.acct.as_deref(), Some("coverage-account"));
     }
 
     #[tokio::test]

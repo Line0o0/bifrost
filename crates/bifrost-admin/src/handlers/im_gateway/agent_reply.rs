@@ -443,20 +443,22 @@ pub(super) fn is_remote_markdown_image_attachment_candidate(raw_url: &str) -> bo
 async fn download_agent_reply_remote_image(
     image: &AgentReplyRemoteImage,
 ) -> bifrost_core::Result<AgentReplyLocalImage> {
-    let http = bifrost_core::outbound_reqwest_client_builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|error| {
-            bifrost_core::BifrostError::Network(format!(
-                "build agent reply image downloader failed: {error}"
-            ))
-        })?;
-    let response = http.get(&image.url).send().await.map_err(|error| {
+    let http = bifrost_core::outbound_reqwest_client().map_err(|error| {
         bifrost_core::BifrostError::Network(format!(
-            "download agent reply image failed: {}",
-            bifrost_core::format_reqwest_error(&error)
+            "build agent reply image downloader failed: {error}"
         ))
     })?;
+    let response = http
+        .get(&image.url)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|error| {
+            bifrost_core::BifrostError::Network(format!(
+                "download agent reply image failed: {}",
+                bifrost_core::format_reqwest_error(&error)
+            ))
+        })?;
     if !response.status().is_success() {
         return Err(bifrost_core::BifrostError::Network(format!(
             "download agent reply image returned HTTP {}",
@@ -996,13 +998,6 @@ fn first_non_empty<const N: usize>(values: [Option<&str>; N]) -> Option<String> 
         .map(str::to_string)
 }
 
-pub(super) fn should_send_plain_im_task_start_notice(
-    provider: &ImProviderConfig,
-    progress_enabled: bool,
-) -> bool {
-    provider.provider_type == ImProviderType::Weixin && !progress_enabled
-}
-
 pub(super) fn build_agent_reply_target(
     provider: &ImProviderConfig,
     event: &ImEvent,
@@ -1111,6 +1106,7 @@ pub(super) async fn send_agent_reply_with_title(
         message_id,
         msg_type: Some("interactive".to_string()),
         content_preview: Some(truncate_str(&reply_text_for_card, 200)),
+        content: Some(reply_text_for_card.clone()),
         trigger: Some("agent".to_string()),
         error: error_msg,
         sender_open_id: None,
@@ -1188,6 +1184,7 @@ pub(super) async fn send_agent_reply_images(
             message_id,
             msg_type: Some("image".to_string()),
             content_preview: Some(format!("[image:{label}]")),
+            content: Some(format!("[image:{label}]")),
             trigger: Some("agent".to_string()),
             error: error_msg,
             sender_open_id: None,
@@ -1356,6 +1353,7 @@ pub(super) async fn send_agent_reply_with_plan(
         message_id,
         msg_type: Some("interactive".to_string()),
         content_preview: Some(truncate_str(&reply_text_for_card, 200)),
+        content: Some(reply_text_for_card.clone()),
         trigger: Some("agent_continuation".to_string()),
         error: error_msg,
         sender_open_id: None,
@@ -1414,7 +1412,7 @@ pub(super) async fn send_error_card_to_owner(
         "config": { "width_mode": "fill" },
         "header": {
             "template": "red",
-            "title": { "tag": "plain_text", "content": "Bifrost Agent Error" }
+            "title": { "tag": "plain_text", "content": "Agent Runner Error" }
         },
         "body": {
             "elements": [{

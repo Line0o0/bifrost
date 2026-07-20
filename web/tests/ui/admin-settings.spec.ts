@@ -1,4 +1,5 @@
 import { test, expect, type Route } from "@playwright/test";
+import { getDefaultRemoteBaseUrl } from "../../src/api/sync";
 import {
   apiBase,
   backendPort,
@@ -9,6 +10,8 @@ import {
   waitForToast,
   uniqueName,
 } from "./helpers/admin-helpers";
+
+const DEFAULT_REMOTE_BASE_URL = getDefaultRemoteBaseUrl();
 
 test.describe.configure({ mode: "serial" });
 
@@ -376,7 +379,7 @@ test("Settings 性能配置在第二个页面主动刷新后可见", async ({
   }
 });
 
-test("Network 超级性能模式浮层可跳转并高亮 Performance 开关", async ({
+test("Network 超级性能模式覆盖整个工作区并可跳转高亮 Performance 开关", async ({
   page,
   request,
 }) => {
@@ -391,10 +394,81 @@ test("Network 超级性能模式浮层可跳转并高亮 Performance 开关", as
       data: { super_performance_mode: true },
     });
 
-    await openPage(page, "traffic");
+    let releasePerformanceRequest!: () => void;
+    const performanceRequestGate = new Promise<void>((resolve) => {
+      releasePerformanceRequest = resolve;
+    });
+    await page.route("**/_bifrost/api/config/performance", async (route) => {
+      await performanceRequestGate;
+      await route.continue();
+    });
+
+    const navigation = openPage(page, "traffic");
+    const loading = page.getByTestId("traffic-performance-loading");
     const overlay = page.getByTestId("traffic-super-performance-overlay");
+    await expect(loading).toBeVisible();
+    await expect(loading).toContainText("Loading Network...");
+    await expect(overlay).toHaveCount(0);
+    releasePerformanceRequest();
+    await navigation;
+    await expect(loading).toHaveCount(0);
+    const trafficPage = page.getByTestId("traffic-page");
+    const detailPane = page.getByTestId("traffic-detail-pane");
+    const trafficTable = page.getByTestId("traffic-table");
+    const filterSearch = page.getByPlaceholder("Search filters...");
+    const toolbarControl = page.getByTestId("toolbar-clear-all");
+    const globalMenuControl = page.getByTestId("theme-toggle");
     await expect(overlay).toBeVisible();
     await expect(overlay).toContainText("Super performance mode is enabled");
+    await expect(overlay.locator(".ant-alert")).toHaveCount(0);
+
+    const [overlayBox, pageBox, detailBox, tableBox, filterBox, toolbarBox, menuBox] =
+      await Promise.all([
+      overlay.boundingBox(),
+      trafficPage.boundingBox(),
+      detailPane.boundingBox(),
+      trafficTable.boundingBox(),
+      filterSearch.boundingBox(),
+      toolbarControl.boundingBox(),
+      globalMenuControl.boundingBox(),
+    ]);
+    expect(overlayBox).not.toBeNull();
+    expect(pageBox).not.toBeNull();
+    expect(detailBox).not.toBeNull();
+    expect(tableBox).not.toBeNull();
+    expect(filterBox).not.toBeNull();
+    expect(toolbarBox).not.toBeNull();
+    expect(menuBox).not.toBeNull();
+    expect(Math.abs(overlayBox!.x - pageBox!.x)).toBeLessThanOrEqual(1);
+    expect(Math.abs(overlayBox!.y - pageBox!.y)).toBeLessThanOrEqual(1);
+    expect(Math.abs(overlayBox!.width - pageBox!.width)).toBeLessThanOrEqual(1);
+    expect(Math.abs(overlayBox!.height - pageBox!.height)).toBeLessThanOrEqual(1);
+
+    for (const coveredBox of [toolbarBox!, filterBox!, tableBox!, detailBox!]) {
+      expect(coveredBox.x).toBeGreaterThanOrEqual(overlayBox!.x);
+      expect(coveredBox.y).toBeGreaterThanOrEqual(overlayBox!.y);
+      expect(coveredBox.x + coveredBox.width).toBeLessThanOrEqual(
+        overlayBox!.x + overlayBox!.width,
+      );
+      expect(coveredBox.y + coveredBox.height).toBeLessThanOrEqual(
+        overlayBox!.y + overlayBox!.height,
+      );
+    }
+    expect(menuBox!.x + menuBox!.width).toBeLessThanOrEqual(overlayBox!.x);
+
+    const lightColors = await overlay.evaluate((element) => {
+      const style = window.getComputedStyle(element);
+      return { background: style.backgroundColor, color: style.color };
+    });
+    expect(lightColors.background).not.toBe("rgb(255, 251, 230)");
+
+    await page.getByTestId("theme-toggle").click();
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+    const darkColors = await overlay.evaluate((element) => {
+      const style = window.getComputedStyle(element);
+      return { background: style.backgroundColor, color: style.color };
+    });
+    expect(darkColors.background).not.toBe(lightColors.background);
 
     await page.getByTestId("traffic-super-performance-disable-button").click();
     await expect(page).toHaveURL(
@@ -997,7 +1071,7 @@ test("Settings Sync 状态信息支持 connected、syncing 与 unreachable", asy
       await request.put(`${apiBase}/sync/config`, {
         data: {
           enabled: false,
-          remote_base_url: "https://bifrost.bytedance.net",
+          remote_base_url: DEFAULT_REMOTE_BASE_URL,
         },
       });
     } catch {
@@ -1123,7 +1197,7 @@ test("Settings Sync 轮询刷新不会覆盖正在编辑的 Bifrost Cloud URL", 
       id: "bytedance_internal",
       name: "ByteDance Internal",
       description: "Internal trusted sync and Remote Invoke provider.",
-      remote_base_url: "https://bifrost.bytedance.net",
+      remote_base_url: DEFAULT_REMOTE_BASE_URL,
       connected: signedIn,
       enabled: true,
       reachable: true,
@@ -1253,7 +1327,7 @@ test("Settings Sync Bifrost Cloud URL 必须先通过基础校验再连接", asy
       body: JSON.stringify({
         enabled: true,
         auto_sync: true,
-        remote_base_url: "https://bifrost.bytedance.net",
+        remote_base_url: DEFAULT_REMOTE_BASE_URL,
         has_session: false,
         reachable: true,
         authorized: false,
@@ -1269,7 +1343,7 @@ test("Settings Sync Bifrost Cloud URL 必须先通过基础校验再连接", asy
             id: "bytedance_internal",
             name: "ByteDance Internal",
             description: "Internal trusted sync and Remote Invoke provider.",
-            remote_base_url: "https://bifrost.bytedance.net",
+            remote_base_url: DEFAULT_REMOTE_BASE_URL,
             connected: false,
             enabled: true,
             reachable: true,
@@ -1351,7 +1425,7 @@ test("Settings Sync 展示三类 Provider 卡片并支持首登弹窗关闭与�
   const statusBody = {
     enabled: true,
     auto_sync: true,
-    remote_base_url: "https://bifrost.bytedance.net",
+    remote_base_url: DEFAULT_REMOTE_BASE_URL,
     has_session: false,
     reachable: true,
     authorized: false,
@@ -1367,7 +1441,7 @@ test("Settings Sync 展示三类 Provider 卡片并支持首登弹窗关闭与�
         id: "bytedance_internal",
         name: "ByteDance Internal",
         description: "Internal trusted sync and Remote Invoke provider.",
-        remote_base_url: "https://bifrost.bytedance.net",
+        remote_base_url: DEFAULT_REMOTE_BASE_URL,
         connected: false,
         enabled: true,
         reachable: true,
@@ -1457,7 +1531,7 @@ test("Settings Sync GitHub Gist 支持 token 登录", async ({ page }) => {
   const baseStatus = {
     enabled: true,
     auto_sync: true,
-    remote_base_url: "https://bifrost.bytedance.net",
+    remote_base_url: DEFAULT_REMOTE_BASE_URL,
     has_session: false,
     reachable: true,
     authorized: false,
@@ -1473,7 +1547,7 @@ test("Settings Sync GitHub Gist 支持 token 登录", async ({ page }) => {
         id: "bytedance_internal",
         name: "ByteDance Internal",
         description: "Internal trusted sync and Remote Invoke provider.",
-        remote_base_url: "https://bifrost.bytedance.net",
+        remote_base_url: DEFAULT_REMOTE_BASE_URL,
         connected: false,
         enabled: true,
         reachable: true,
@@ -1582,7 +1656,7 @@ test("Settings Sync GitHub Gist token 失效时显示卡片级重连提示", asy
       body: JSON.stringify({
         enabled: true,
         auto_sync: true,
-        remote_base_url: "https://bifrost.bytedance.net",
+        remote_base_url: DEFAULT_REMOTE_BASE_URL,
         has_session: true,
         reachable: true,
         authorized: false,
@@ -1598,7 +1672,7 @@ test("Settings Sync GitHub Gist token 失效时显示卡片级重连提示", asy
             id: "bytedance_internal",
             name: "ByteDance Internal",
             description: "Internal trusted sync and Remote Invoke provider.",
-            remote_base_url: "https://bifrost.bytedance.net",
+            remote_base_url: DEFAULT_REMOTE_BASE_URL,
             connected: false,
             enabled: true,
             reachable: true,
@@ -1684,7 +1758,7 @@ test("Settings Sync provider 退出登录只影响当前卡片", async ({ page }
       id: "bytedance_internal",
       name: "ByteDance Internal",
       description: "Internal trusted sync and Remote Invoke provider.",
-      remote_base_url: "https://bifrost.bytedance.net",
+      remote_base_url: DEFAULT_REMOTE_BASE_URL,
       connected: true,
       enabled: true,
       reachable: true,
@@ -1750,7 +1824,7 @@ test("Settings Sync provider 退出登录只影响当前卡片", async ({ page }
   const statusBody = () => ({
     enabled: true,
     auto_sync: true,
-    remote_base_url: "https://bifrost.bytedance.net",
+    remote_base_url: DEFAULT_REMOTE_BASE_URL,
     has_session: providers.some((provider) => provider.connected),
     reachable: true,
     authorized: providers.some((provider) => provider.connected),
@@ -1828,7 +1902,7 @@ test("Settings Sync Remote Invoke 支持 ByteDance、Bifrost Cloud 与双通道�
       body: JSON.stringify({
         enabled: true,
         auto_sync: true,
-        remote_base_url: "https://bifrost.bytedance.net",
+        remote_base_url: DEFAULT_REMOTE_BASE_URL,
         has_session: true,
         reachable: true,
         authorized: true,
@@ -1849,7 +1923,7 @@ test("Settings Sync Remote Invoke 支持 ByteDance、Bifrost Cloud 与双通道�
             id: "bytedance_internal",
             name: "ByteDance Internal",
             description: "Internal trusted sync and Remote Invoke provider.",
-            remote_base_url: "https://bifrost.bytedance.net",
+            remote_base_url: DEFAULT_REMOTE_BASE_URL,
             connected: true,
             enabled: true,
             reachable: true,
@@ -1977,131 +2051,6 @@ test("Settings Agent 三层 instructions 使用大窗口编辑", async ({ page }
     .toBe("Default base prompt\nwith multiple lines\nEdited base prompt from large modal");
 });
 
-test("AI 一级页整合 Agent 子导航并按 URL 切换独立编辑卡片", async ({ page }) => {
-  const agentConfig = {
-    enabled: true,
-    work_dir: "/tmp/agent-ui",
-    base_instructions: "Base prompt",
-    developer_instructions: "Developer instructions",
-    user_instructions: "User instructions",
-    default_base_instructions: "Default base prompt",
-    model: "gpt-test",
-    model_provider: "mock",
-    max_completion_tokens: 4096,
-    model_providers: {
-      mock: {
-        api_key: "$MODEL_API_KEY",
-        request_max_retries: 1,
-        stream_idle_timeout_ms: 30000,
-        stream_max_retries: 2,
-      },
-    },
-    memories: {
-      generate_memories: true,
-      use_memories: true,
-      disable_on_external_context: false,
-      max_raw_memories_for_consolidation: 100,
-      max_unused_days: 90,
-      max_rollout_age_days: 30,
-    },
-    mcp_servers: {
-      filesystem: {
-        enabled: true,
-        transport: "stdio",
-        command: "mock-mcp",
-      },
-    },
-  };
-
-  await page.route("**/_bifrost/api/im-gateway/agent", async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify(agentConfig),
-    });
-  });
-  await page.route("**/_bifrost/api/im-gateway/agent/providers", async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify([
-        {
-          id: "mock",
-          name: "Mock Provider",
-          base_url: "https://model.example.test",
-          env_key: "MODEL_API_KEY",
-        },
-      ]),
-    });
-  });
-
-  await openPage(page, "ai?aiSection=agent-general&agentSection=general");
-
-  await expect(
-    page.locator('[data-testid="app-sidebar-nav-item"][data-nav-label="AI"]'),
-  ).toHaveAttribute("data-nav-key", "/ai");
-  const nav = page.getByTestId("ai-section-nav");
-  await expect(nav).toBeVisible();
-  const layoutBox = await page.getByTestId("ai-page-layout").boundingBox();
-  const navBox = await nav.boundingBox();
-  expect(layoutBox && navBox && navBox.y - layoutBox.y).toBeGreaterThanOrEqual(12);
-  await expect(page.getByTestId("ai-nav-agent-general")).toHaveAttribute(
-    "aria-current",
-    "true",
-  );
-  await expect(page.getByTestId("agent-settings-section-general")).toBeVisible();
-  await expect(page.getByTestId("agent-settings-section-mcp-servers")).toHaveCount(0);
-
-  await page.getByTestId("ai-nav-agent-mcp-servers").click();
-  await expect(page.getByTestId("ai-nav-agent-mcp-servers")).toHaveAttribute(
-    "aria-current",
-    "true",
-  );
-  await expect(page).toHaveURL(/aiSection=agent-mcp-servers/);
-  await expect(page).toHaveURL(/agentSection=mcp-servers/);
-  await expect(page.getByTestId("agent-settings-section-mcp-servers")).toBeVisible();
-  await expect(page.getByTestId("agent-settings-section-general")).toHaveCount(0);
-
-  await page.reload();
-  await expect(page.getByTestId("ai-nav-agent-mcp-servers")).toHaveAttribute(
-    "aria-current",
-    "true",
-  );
-  await expect(page.getByTestId("agent-settings-section-mcp-servers")).toBeVisible();
-  await expect(page.getByTestId("agent-settings-section-general")).toHaveCount(0);
-
-  await page.getByTestId("ai-nav-agent-runtime").click();
-  await expect(page.getByTestId("ai-nav-agent-runtime")).toHaveAttribute(
-    "aria-current",
-    "true",
-  );
-  await expect(page).toHaveURL(/aiSection=agent-runtime/);
-  await expect(page).toHaveURL(/agentSection=runtime/);
-  await expect(page.getByTestId("agent-settings-section-runtime")).toBeVisible();
-  await expect(page.getByTestId("agent-settings-section-mcp-servers")).toHaveCount(0);
-
-  await page.getByTestId("theme-toggle").click();
-  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
-  await page.getByTestId("ai-nav-agent-mcp-servers").click();
-  await expect(page).toHaveURL(/aiSection=agent-mcp-servers/);
-  await expect(page).toHaveURL(/agentSection=mcp-servers/);
-  await expect(page.getByTestId("ai-nav-agent-mcp-servers")).toHaveAttribute(
-    "aria-current",
-    "true",
-  );
-  await expect(page.getByTestId("agent-settings-section-mcp-servers")).toBeVisible();
-  await expect(page.getByTestId("agent-settings-section-runtime")).toHaveCount(0);
-
-  await openPage(page, "ai?session=stale-session&view=active");
-  await expect(page.getByTestId("ai-nav-agent-sessions")).toHaveAttribute(
-    "aria-current",
-    "true",
-  );
-  await page.getByTestId("ai-nav-agent-runtime").click();
-  await expect(page).not.toHaveURL(/session=/);
-  await expect(page.getByTestId("agent-settings-section-runtime")).toBeVisible();
-});
-
 test("Agent Runners 新增弹窗只展示当前支持的 Adapter", async ({ page }) => {
   await page.route("**/_bifrost/api/im-gateway/agent", async (route) => {
     await route.fulfill({
@@ -2163,7 +2112,7 @@ test("AI Agent Chat section 展示聊天工作台并支持真实流式发送", a
       body: JSON.stringify({ sessions: [] }),
     });
   });
-  await page.route("**/_bifrost/api/agent/chat/stream", async (route) => {
+  await page.route("**/_bifrost/api/im-gateway/chat/stream", async (route) => {
     await route.fulfill({
       status: 200,
       contentType: "text/event-stream",
@@ -2177,7 +2126,7 @@ test("AI Agent Chat section 展示聊天工作台并支持真实流式发送", a
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({ defaultRunnerId: "bifrost_agent", runners: {}, channels: {} }),
+      body: JSON.stringify({ defaultRunnerId: "codex", runners: {}, channels: {} }),
     });
   });
   await page.route("**/_bifrost/api/im-gateway/chat/stream", async (route) => {
@@ -2511,186 +2460,6 @@ test("AI Agent Sessions 列表支持点击 title 或整行进入详情", async (
   await expect(page).toHaveURL(/view=active/);
   await expect(page.getByRole("tab", { name: /Messages/ })).toHaveAttribute("aria-selected", "true");
   await expect(page.getByText("Active detail opened")).toBeVisible();
-});
-
-test("Settings Agent 模型配置支持关闭 reasoning 参数", async ({ page }) => {
-  const agentConfig = {
-    enabled: true,
-    model: "gpt-5.5-2026-04-01",
-    model_provider: "mock",
-    model_providers: {
-      mock: {
-        name: "Mock Provider",
-        base_url: "https://model.example.test",
-        api_key: "$MODEL_API_KEY",
-      },
-    },
-    model_reasoning_effort: "medium",
-    model_reasoning_summary: "auto",
-    max_completion_tokens: 16384,
-    model_context_window: 250000,
-    mcp_servers: {},
-  };
-  const patches: Record<string, unknown>[] = [];
-
-  await page.route("**/_bifrost/api/im-gateway/agent", async (route) => {
-    if (route.request().method() === "PATCH") {
-      const patch = route.request().postDataJSON() as Record<string, unknown>;
-      patches.push(patch);
-      Object.assign(agentConfig, patch);
-    }
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify(agentConfig),
-    });
-  });
-  await page.route("**/_bifrost/api/im-gateway/agent/providers", async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify([
-        {
-          id: "mock",
-          name: "Mock Provider",
-          base_url: "https://model.example.test",
-          env_key: "MODEL_API_KEY",
-        },
-      ]),
-    });
-  });
-
-  await openPage(page, "ai?aiSection=agent-model&agentSection=model");
-  await expect(page.getByTestId("agent-settings-section-model")).toBeVisible();
-
-  await setSelectValue(
-    page,
-    page.getByTestId("agent-model-reasoning-effort-select"),
-    "None (disabled)",
-  );
-  await waitForToast(page, "Updated model reasoning effort");
-  await setSelectValue(
-    page,
-    page.getByTestId("agent-model-reasoning-summary-select"),
-    "None (disabled)",
-  );
-  await waitForToast(page, "Updated model reasoning summary");
-
-  expect(patches).toContainEqual({ model_reasoning_effort: "none" });
-  expect(patches).toContainEqual({ model_reasoning_summary: "none" });
-});
-
-test("AI Agent 默认值显示在输入框 placeholder", async ({ page }) => {
-  await page.route("**/_bifrost/api/im-gateway/agent", async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify({
-        enabled: true,
-        model: "gpt-placeholder",
-        model_provider: "mock",
-        model_providers: {
-          mock: {
-            name: "Mock Provider",
-            base_url: "https://model.example.test",
-            api_key: "$MODEL_API_KEY",
-          },
-        },
-        model_reasoning_effort: "medium",
-        model_reasoning_summary: "auto",
-        max_completion_tokens: 16384,
-        model_context_window: 250000,
-        memories: {},
-        mcp_servers: {},
-      }),
-    });
-  });
-  await page.route("**/_bifrost/api/im-gateway/agent/providers", async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify([
-        {
-          id: "mock",
-          name: "Mock Provider",
-          base_url: "https://model.example.test",
-          env_key: "MODEL_API_KEY",
-          request_max_retries: 4,
-          stream_idle_timeout_ms: 300000,
-          stream_max_retries: 5,
-        },
-      ]),
-    });
-  });
-
-  await openPage(page, "ai?aiSection=agent-model&agentSection=model");
-  const modelSection = page.getByTestId("agent-settings-section-model");
-  await expect(modelSection.getByText("Provider Connection")).toBeVisible();
-  await expect(modelSection.locator('input[placeholder="4"]')).toBeVisible();
-  await expect(modelSection.locator('input[placeholder="300000"]')).toBeVisible();
-  await expect(modelSection.locator('input[placeholder="5"]')).toBeVisible();
-
-  await openPage(page, "ai?aiSection=agent-memories&agentSection=memories");
-  const memoriesSection = page.getByTestId("agent-settings-section-memories");
-  await expect(memoriesSection.getByText("Memories", { exact: true })).toBeVisible();
-  await expect(memoriesSection.locator('input[placeholder="512"]')).toBeVisible();
-  await expect(memoriesSection.locator('input[placeholder="No limit"]')).toHaveCount(2);
-  await expect(
-    memoriesSection.locator('input[placeholder="Current model (gpt-placeholder)"]'),
-  ).toHaveCount(2);
-});
-
-test("AI Agent Runtime Settings 支持恢复默认值", async ({ page }) => {
-  const agentConfig = {
-    enabled: true,
-    model: "gpt-runtime",
-    model_provider: "mock",
-    model_providers: {},
-    shell_timeout_secs: 30,
-    max_turn_iterations: 20,
-    session_ttl_secs: 120,
-    request_timeout_secs: 90,
-    tool_output_token_limit: 2000,
-    project_doc_max_bytes: 1024,
-    background_terminal_max_timeout: 300000,
-    mcp_servers: {},
-  };
-  const patches: Record<string, unknown>[] = [];
-
-  await page.route("**/_bifrost/api/im-gateway/agent", async (route) => {
-    if (route.request().method() === "PATCH") {
-      const patch = route.request().postDataJSON() as Record<string, unknown>;
-      patches.push(patch);
-      Object.assign(agentConfig, patch);
-    }
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify(agentConfig),
-    });
-  });
-  await page.route("**/_bifrost/api/im-gateway/agent/providers", async (route) => {
-    await route.fulfill({ status: 200, contentType: "application/json", body: "[]" });
-  });
-
-  await openPage(page, "ai?aiSection=agent-runtime&agentSection=runtime");
-  const runtimeSection = page.getByTestId("agent-settings-section-runtime");
-  await expect(runtimeSection.getByText("Runtime Settings")).toBeVisible();
-
-  await runtimeSection.getByTestId("agent-runtime-restore-defaults").click();
-  await waitForToast(page, "Runtime settings restored to defaults");
-
-  expect(patches).toContainEqual({
-    max_turn_iterations: 1000,
-    session_ttl_secs: 3600,
-    request_timeout_secs: 600,
-    tool_output_token_limit: 10000,
-    project_doc_max_bytes: 32768,
-    background_terminal_max_timeout: 600000,
-  });
-  await expect(runtimeSection.locator('input[value="600"]').first()).toBeVisible();
-  await expect(runtimeSection.locator('input[value="1000"]')).toBeVisible();
-  await expect(runtimeSection.locator('input[value="10000"]')).toBeVisible();
 });
 
 test("Settings IM Provider instructions 使用大窗口编辑后保存覆盖值", async ({
@@ -3716,7 +3485,7 @@ test("Settings Sync 支持登录、同步、更新覆盖与断网重连", async 
       await request.put(`${apiBase}/sync/config`, {
         data: {
           enabled: false,
-          remote_base_url: "https://bifrost.bytedance.net",
+          remote_base_url: DEFAULT_REMOTE_BASE_URL,
         },
       });
     } catch {

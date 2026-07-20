@@ -1,6 +1,6 @@
 [package]
 name = "bifrost-e2e"
-version = "0.0.151"
+version = "0.0.157"
 edition = "2021"
 description = "End-to-end testing framework for Bifrost proxy"
 authors = ["Bifrost Team"]
@@ -56,6 +56,5 @@ bytes = { workspace = true }
 portpicker = "0.1"
 urlencoding = "2.1"
 tempfile = { workspace = true }
-temp-env = { version = "0.3", features = ["async_closure"] }
 
 [dev-dependencies]

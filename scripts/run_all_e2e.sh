@@ -73,7 +73,6 @@ ISOLATED_AFTER_TESTS=(
   "test_remote_shell_exec_streaming_e2e.sh"
   "test_traffic_db_e2e.sh"
   "test_openai_like_sse_search_e2e.sh"
-  "test_agent_send_msg_default_channel.sh"
   "test_e2e_process_cleanup_isolation.sh"
 )
 
@@ -189,6 +188,7 @@ Options:
 Environment variables:
   BIFROST_E2E_SHARD_INDEX  Shard index (1-indexed), same as N in --shard N/M
   BIFROST_E2E_SHARD_TOTAL  Total shards, same as M in --shard N/M
+  BIFROST_E2E_SHELL_TESTS  Optional comma-separated exact shell test names
 EOF
 }
 
@@ -627,10 +627,7 @@ SKIP_IN_CI_TESTS=(
   # These shell wrappers are pure Rust compile/test contract checks, not shell
   # E2E flows. Keep them local-only so CI shell jobs do not compile again after
   # the dedicated unit/integration jobs already covered the Rust paths.
-  "test_agent_codex_parity_contracts.sh"
   "test_chatgpt_web_shared_profile.sh"
-  "test_im_agent_markdown_image_reply.sh"
-  "test_im_agent_streaming_progress_card.sh"
   "test_utf8_safe_preview_e2e.sh"
   # These two desktop contract wrappers spend 18-19 minutes compiling the
   # Tauri graph on macOS. Keep them as explicit local desktop release
@@ -642,7 +639,6 @@ SKIP_IN_CI_TESTS=(
   # CI never fails because a runtime dependency or model host is unavailable.
   "test_asr_admin_csrf.sh"
   "test_asr_daily_agent_template.sh"
-  "test_asr_daily_agents_api.sh"
   "test_asr_diarization_cli.sh"
   "test_asr_model_autonomy.sh"
   "test_asr_platform_gating.sh"
@@ -673,13 +669,10 @@ is_skipped_in_ci() {
 # a small default; exact values are not critical, only relative ordering is.
 shell_test_weight() {
   case "$1" in
-    test_agent_send_msg_default_channel.sh) echo 30 ;;
-    test_long_term_memory_remember_recall.sh) echo 207 ;;
     test_desktop_open_requests_contract.sh) echo 620 ;;
     test_sync_github_gist_expired_status_e2e.sh) echo 302 ;;
     test_im_gateway_long_reply_delivery_regression.sh) echo 178 ;;
     test_tls_intercept_e2e.sh) echo 170 ;;
-    test_agent_send_msg_feishu_card.sh) echo 162 ;;
     test_skill_creator_flow.sh) echo 148 ;;
     test_remote_file_relay_e2e.sh) echo 132 ;;
     test_http3_e2e.sh) echo 120 ;;
@@ -689,7 +682,6 @@ shell_test_weight() {
     test_chatgpt_web_behavior_artifacts.sh) echo 85 ;;
     test_remote_invoke_e2e.sh) echo 75 ;;
     test_security_hardening_functional.sh) echo 72 ;;
-    test_agent_builtin_status_runtime.sh) echo 61 ;;
     test_remote_invoke_ssh_e2e.sh) echo 59 ;;
     test_devtools_page_bridge_api.sh) echo 52 ;;
     test_group_sync_e2e.sh) echo 46 ;;
@@ -727,6 +719,10 @@ shell_test_runs_serial_in_parallel_shell_job() {
   case "$1" in
     test_memory_pressure_e2e.sh|\
     test_large_body_protection.sh|\
+    test_body_cache_sync_cleanup_admin_api.sh|\
+    test_process_resolution_performance.sh|\
+    test_super_performance_mode.sh|\
+    test_upgrade_tls_trust_e2e.sh|\
     test_remote_connect_overload_retry_e2e.sh|\
     test_client_process_transport_attribution.sh|\
     test_remote_job_real_e2e.sh|\
@@ -734,18 +730,11 @@ shell_test_runs_serial_in_parallel_shell_job() {
     test_remote_shell_exec_streaming_e2e.sh|\
     test_traffic_db_e2e.sh|\
     test_openai_like_sse_search_e2e.sh|\
-    test_agent_send_msg_default_channel.sh|\
-    test_agent_builtin_status_runtime.sh|\
-    test_agent_codex_parity_contracts.sh|\
-    test_agent_loop_runtime_limits.sh|\
     test_asr_model_autonomy.sh|\
     test_asr_task_pause_resume.sh|\
     test_chatgpt_web_behavior_artifacts.sh|\
     test_http3_e2e.sh|\
-    test_im_agent_markdown_image_reply.sh|\
-    test_im_agent_streaming_progress_card.sh|\
     test_im_gateway_long_reply_delivery_regression.sh|\
-    test_long_term_memory_remember_recall.sh|\
     test_qwen3_asr_local_server.sh|\
     test_qwen3_asr_runtime_guards.sh|\
     test_skill_creator_flow.sh|\
@@ -773,11 +762,11 @@ shell_test_capability_group() {
     test_setting_ssh_key_cli.sh|\
     test_ssh_key_*|\
     test_status_tui_remote_invoke_panel.sh|\
+    test_client_process_transport_attribution.sh|\
     test_cli_online_commands_e2e.sh|\
     test_sync_*|\
     test_group_sync_*|\
     test_security_hardening_functional.sh|\
-    test_long_term_memory_remember_recall.sh|\
     test_e2e_scripts_disable_sync_login_prompt.sh|\
     test_install_*|\
     test_desktop_*|\
@@ -961,7 +950,18 @@ collect_shell_shard_assignments() {
 
 collect_all_shell_tests() {
   local all_tests=()
-  if [[ "$SHELL_MODE" == "full" ]]; then
+  if [[ -n "${BIFROST_E2E_SHELL_TESTS:-}" ]]; then
+    local requested=()
+    local name
+    IFS=',' read -r -a requested <<<"$BIFROST_E2E_SHELL_TESTS"
+    for name in "${requested[@]}"; do
+      if [[ -z "$name" || "$name" == */* || ! -f "$E2E_DIR/tests/$name" ]]; then
+        echo "Error: invalid BIFROST_E2E_SHELL_TESTS entry: $name" >&2
+        return 1
+      fi
+      all_tests+=("$name")
+    done
+  elif [[ "$SHELL_MODE" == "full" ]]; then
     while IFS= read -r script_path; do
       local name
       name="$(basename "$script_path")"
@@ -1138,6 +1138,37 @@ print_final_report() {
       echo "  reason: ${SUITE_REASONS[$i]}"
     done
   fi
+
+  write_machine_report
+}
+
+write_machine_report() {
+  local ledger="$REPORT_DIR/summary.tsv"
+  local output="${BIFROST_E2E_SUMMARY_JSON:-$REPORT_DIR/summary.json}"
+  local i
+
+  : > "$ledger"
+  for i in "${!SUITE_NAMES[@]}"; do
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "${SUITE_STATUSES[$i]}" \
+      "$(tsv_clean "${SUITE_NAMES[$i]}")" \
+      "${SUITE_DURATIONS[$i]}" \
+      "$(tsv_clean "${SUITE_LOGS[$i]}")" \
+      "$(tsv_clean "${SUITE_REASONS[$i]}")" >> "$ledger"
+  done
+
+  python3 scripts/ci/e2e-summary.py "$ledger" "$output" \
+    --metadata "platform=$PLATFORM" \
+    --metadata "mode=$MODE" \
+    --metadata "shell_mode=$SHELL_MODE" \
+    --metadata "shard=${SHARD_INDEX}/${SHARD_TOTAL}"
+}
+
+tsv_clean() {
+  local value="$1"
+  value="${value//$'\t'/ }"
+  value="${value//$'\n'/\\n}"
+  printf '%s' "$value"
 }
 
 should_skip_full_shell_test() {
@@ -1191,6 +1222,18 @@ run_shell_tests_parallel() {
     "test_large_body_protection.sh"
   )
 
+  # These tests own a long-lived Python fixture and wait for it during a
+  # hosted-runner cold start. macOS CI showed that starting them beside another
+  # proxy-heavy suite can leave the child alive but unscheduled long enough to
+  # miss its readiness deadline. Keep them in the serial lane so readiness
+  # measures the fixture itself rather than sibling resource contention.
+  local STARTUP_SENSITIVE_TESTS=(
+    "test_body_cache_sync_cleanup_admin_api.sh"
+    "test_process_resolution_performance.sh"
+    "test_super_performance_mode.sh"
+    "test_upgrade_tls_trust_e2e.sh"
+  )
+
   # PR-G-CI-FIX: isolated-after tests
   # These tests spawn long-lived bifrost/python children that escape the
   # per-test subshell trap. Run serially and clean only Bifrost PIDs recorded
@@ -1209,18 +1252,12 @@ run_shell_tests_parallel() {
   # Cargo's shared target artifact lock while sibling tests compile. Keep them
   # serial so the timeout measures test work instead of lock contention.
   local CARGO_HEAVY_TESTS=(
-    "test_agent_builtin_status_runtime.sh"
-    "test_agent_codex_parity_contracts.sh"
-    "test_agent_loop_runtime_limits.sh"
     "test_asr_model_autonomy.sh"
     "test_asr_task_pause_resume.sh"
     "test_chatgpt_web_behavior_artifacts.sh"
     "test_client_process_transport_attribution.sh"
     "test_http3_e2e.sh"
-    "test_im_agent_markdown_image_reply.sh"
-    "test_im_agent_streaming_progress_card.sh"
     "test_im_gateway_long_reply_delivery_regression.sh"
-    "test_long_term_memory_remember_recall.sh"
     "test_qwen3_asr_local_server.sh"
     "test_qwen3_asr_runtime_guards.sh"
     "test_skill_creator_flow.sh"
@@ -1251,6 +1288,14 @@ run_shell_tests_parallel() {
       fi
     done
 
+    local is_startup_sensitive=0
+    for st in "${STARTUP_SENSITIVE_TESTS[@]}"; do
+      if [[ "$script_name" == "$st" ]]; then
+        is_startup_sensitive=1
+        break
+      fi
+    done
+
     # PR-G-CI-FIX: isolated-after tests
     local is_isolated_after=0
     for it in "${ISOLATED_AFTER_TESTS[@]}"; do
@@ -1268,7 +1313,7 @@ run_shell_tests_parallel() {
       fi
     done
 
-    if [[ "$is_mock_managing" -eq 1 || "$is_resource_heavy" -eq 1 || "$is_isolated_after" -eq 1 || "$is_cargo_heavy" -eq 1 ]]; then
+    if [[ "$is_mock_managing" -eq 1 || "$is_resource_heavy" -eq 1 || "$is_startup_sensitive" -eq 1 || "$is_isolated_after" -eq 1 || "$is_cargo_heavy" -eq 1 ]]; then
       serial_tests+=("$script_name")
     else
       parallel_tests+=("$script_name")
@@ -1766,7 +1811,11 @@ if [[ "$RUN_UI" -eq 1 ]]; then
 
   header "Running Playwright UI E2E suite"
   if [[ "$ui_build_ok" -eq 1 ]]; then
-    run_and_capture "ui:playwright" "$PNPM_BIN" --dir web run test:ui
+    if [[ "${BIFROST_UI_TEST_PROFILE:-full}" == "critical" ]]; then
+      run_and_capture "ui:playwright-critical" bash scripts/ci/run-ui-critical.sh
+    else
+      run_and_capture "ui:playwright" "$PNPM_BIN" --dir web run test:ui
+    fi
   else
     skip_suite "ui:playwright" "ui debug build failed"
   fi

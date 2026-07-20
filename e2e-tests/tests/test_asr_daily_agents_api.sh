@@ -1,465 +1,449 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+unset BIFROST_DETACHED_DAEMON_CHILD
+unset BIFROST_EXTERNAL_CLI_WORKER
+
+: "${BIFROST_SYNC_DISABLE_AUTO_LOGIN_PROMPT:=1}"
 : "${BIFROST_DISABLE_TRAY:=1}"
+export BIFROST_SYNC_DISABLE_AUTO_LOGIN_PROMPT
 export BIFROST_DISABLE_TRAY
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cd "$ROOT_DIR"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+cd "$REPO_DIR"
 
-DATA_DIR="$(mktemp -d "${TMPDIR:-/tmp}/bifrost-asr-daily-agents-e2e.XXXXXX")"
-AUDIO_DIR="$(mktemp -d "${TMPDIR:-/tmp}/bifrost-asr-daily-agents-audio.XXXXXX")"
-SYNC_DIR="$(mktemp -d "${TMPDIR:-/tmp}/bifrost-asr-daily-agents-sync.XXXXXX")"
-E2E_DIR="$DATA_DIR/e2e"
-PORT="${BIFROST_E2E_PORT:-18997}"
-MOCK_PORT="${BIFROST_DAILY_AGENT_MOCK_PORT:-18998}"
-BIN="${BIFROST_BIN:-target/debug/bifrost}"
-PID=""
-MOCK_PID=""
+TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/bifrost-daily-research-e2e.XXXXXX")"
+DATA_DIR="$TEST_DIR/data"
+AUDIO_DIR="$TEST_DIR/audio"
+MOCK_CODEX="$TEST_DIR/mock-codex"
+BIFROST_LOG="$TEST_DIR/bifrost.log"
+BIFROST_BIN="${BIFROST_BIN:-$REPO_DIR/target/debug/bifrost}"
+BIFROST_PORT="${BIFROST_PORT:-$(python3 - <<'PY'
+import socket
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+)}"
 
 cleanup() {
   local status=$?
-  if [[ $status -ne 0 && -f "$DATA_DIR/server.log" ]]; then
-    echo "---- bifrost server.log ----" >&2
-    sed -n '1,240p' "$DATA_DIR/server.log" >&2 || true
-    echo "---- end server.log ----" >&2
+  if [[ -n "${BIFROST_PID:-}" ]]; then
+    kill "$BIFROST_PID" >/dev/null 2>&1 || true
+    wait "$BIFROST_PID" >/dev/null 2>&1 || true
   fi
-  if [[ -n "$PID" ]]; then
-    kill "$PID" >/dev/null 2>&1 || true
-    wait "$PID" >/dev/null 2>&1 || true
-  fi
-  if [[ -n "$MOCK_PID" ]]; then
-    kill "$MOCK_PID" >/dev/null 2>&1 || true
-    wait "$MOCK_PID" >/dev/null 2>&1 || true
-  fi
-  if [[ $status -eq 0 ]]; then
-    rm -rf "$DATA_DIR" "$AUDIO_DIR" "$SYNC_DIR"
+  if [[ $status -ne 0 || "${KEEP_TEST_DIR:-false}" == "true" ]]; then
+    tail -200 "$BIFROST_LOG" >&2 || true
+    echo "[asr-daily-agents] test data: $TEST_DIR" >&2
   else
-    echo "Keeping failed E2E data dir: $DATA_DIR" >&2
-    echo "Keeping failed E2E audio dir: $AUDIO_DIR" >&2
-    echo "Keeping failed E2E sync dir: $SYNC_DIR" >&2
+    rm -rf "$TEST_DIR"
   fi
 }
 trap cleanup EXIT
 
-mkdir -p "$E2E_DIR"
+mkdir -p "$DATA_DIR" "$AUDIO_DIR"
 
-MODEL_LOG="$E2E_DIR/mock-model.jsonl"
-cat > "$DATA_DIR/mock_model.py" <<'PY'
+cat >"$MOCK_CODEX" <<'PY'
+#!/usr/bin/env python3
 import json
+import os
+import pathlib
 import re
 import sys
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-port = int(sys.argv[1])
-model_log = sys.argv[2]
+if "--version" in sys.argv:
+    print("codex-cli 0.144.1")
+    raise SystemExit(0)
 
-def tool_call(call_id, name, arguments):
-    return {
-        "id": call_id,
-        "type": "function",
-        "function": {
-            "name": name,
-            "arguments": json.dumps(arguments, ensure_ascii=False),
-        },
-    }
+thread_id = f"thread-daily-{os.getpid()}"
+turn_index = 0
 
-def stringify(value):
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        return "\n".join(stringify(item) for item in value)
-    if isinstance(value, dict):
-        if isinstance(value.get("text"), str):
-            return value["text"]
-        if isinstance(value.get("content"), str):
-            return value["content"]
-        return json.dumps(value, ensure_ascii=False)
-    return str(value)
+def send(value):
+    print(json.dumps(value, separators=(",", ":")), flush=True)
 
-class Handler(BaseHTTPRequestHandler):
-    def _json(self, status, payload):
-        data = json.dumps(payload, ensure_ascii=False).encode()
-        self.send_response(status)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+def report_content(report_path, prompt):
+    if "/research_dispatcher/" in report_path:
+        if "2026-07-14-report.md" in report_path:
+            return """# Research manifest
 
-    def do_GET(self):
-        self._json(200, {"ok": True})
+```json
+{"questions":[]}
+```
+"""
+        return """# Research manifest
 
-    def do_POST(self):
-        length = int(self.headers.get("content-length") or 0)
-        body = self.rfile.read(length) if length else b"{}"
-        payload = json.loads(body.decode("utf-8") or "{}")
-        with open(model_log, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+```json
+{"questions":[{"id":"github-question","original_question":"IBKR 仓库如何计算成交成本？","source_excerpt":"帮我记录一下并研究 IBKR 成交成本","background":"日报中的投资研究问题","runner":"web-research","github_repositories":["ibkr-portfolio-dashboard"],"research_prompt":"列出实际读取的仓库文件"},{"id":"product-question","original_question":"日报研究问题如何做到每题独立会话？","source_excerpt":"帮我记录一下自动研究流程","background":"日报 Agent 产品设计","runner":"web-research","research_prompt":"给出直接结论"}]}
+```
+"""
+    if "/research_seed/" in report_path:
+        if "2026-07-14-report.md" in report_path:
+            return """# Research seeds
 
-        tool_names = {
-            tool.get("function", {}).get("name")
-            for tool in payload.get("tools", [])
-            if tool.get("type") == "function"
-        }
-        if "write_file" not in tool_names:
-            self._json(500, {"error": f"write_file tool missing: {sorted(tool_names)}"})
-            return
+```json
+{"research_questions":[],"non_research_items":[{"source_excerpt":"修复线上超时","classification":"internal_investigation","reason":"这是内部执行事项"}]}
+```
+"""
+        return """# Research seeds
 
-        messages = payload.get("messages", [])
-        full_text = "\n".join(stringify(message.get("content")) for message in messages)
-        has_tool_result = any(message.get("role") == "tool" for message in messages)
+```json
+{"research_questions":[{"id":"github-question","original_question":"IBKR 仓库如何计算成交成本？","source_excerpt":"帮我记录一下并研究 IBKR 成交成本","background":"日报中的投资研究问题","intent_evidence":"需要仓库代码和计算口径","expected_evidence":["实际仓库文件"]},{"id":"product-question","original_question":"日报研究问题如何做到每题独立会话？","source_excerpt":"帮我记录一下自动研究流程","background":"日报 Agent 产品设计","intent_evidence":"需要跨产品研究与方案比较","expected_evidence":["产品与实现资料"]}],"non_research_items":[{"source_excerpt":"帮我记录一下修复线上超时","classification":"internal_investigation","reason":"需要当前系统日志和 Trace，不是外部研究"}]}
+```
+"""
+    if "/research_digest/" in report_path:
+        if "2026-07-14-report.md" in report_path:
+            return "# Research digest\n\n本日报未识别到需要外部研究的问题。\n"
+        links = []
+        for upstream in pathlib.Path.cwd().glob("input/upstream/research_fanout/*-report.md"):
+            links.extend(re.findall(r"https://chatgpt\.com/c/[A-Za-z0-9_-]+", upstream.read_text(encoding="utf-8")))
+        unique_links = sorted(set(links))
+        return (
+            "# Research digest\n\n"
+            "## IBKR 仓库如何计算成交成本？\n\n"
+            "- 核心结论：已由独立研究会话处理。\n"
+            + "".join(f"- 完整研究：{link}\n" for link in unique_links)
+        )
+    return (
+        "# Daily report\n\n"
+        "- 原始问题：帮我记录一下并研究 IBKR 成交成本。\n"
+        "- 决定：每题使用独立研究会话。\n"
+        "- 待办：保留原始问题和完整研究链接。\n"
+    )
 
-        if has_tool_result:
-            message = {"role": "assistant", "content": "daily agent report written"}
-            finish_reason = "stop"
+for line in sys.stdin:
+    frame = json.loads(line)
+    method = frame.get("method")
+    request_id = frame.get("id")
+    if method == "initialize":
+        send({"jsonrpc":"2.0","id":request_id,"result":{"userAgent":"mock-daily-codex"}})
+    elif method in ("thread/start", "thread/resume"):
+        send({"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":thread_id}}})
+        send({"jsonrpc":"2.0","id":request_id,"result":{"thread":{"id":thread_id}}})
+    elif method == "turn/start":
+        turn_index += 1
+        turn_id = f"turn-daily-{turn_index}"
+        prompt = frame["params"]["input"][0]["text"]
+        send({"jsonrpc":"2.0","id":request_id,"result":{"turn":{"id":turn_id}}})
+        match = re.search(r"report=([^\n\r]+)", prompt)
+        if not match:
+            message = "mock daily runner received a prompt without a report target"
         else:
-            match = re.search(r"report=([^\n\r]+)", full_text)
-            if not match:
-                self._json(500, {"error": "report target missing from prompt", "text": full_text[-1000:]})
-                return
-            report_path = match.group(1).strip()
-            agent_id = "tomorrow_todo" if "tomorrow_todo/" in report_path else "daily_report"
-            if agent_id == "tomorrow_todo" and "E2E_CUSTOM_TOMORROW_AGENT_MARKER" not in full_text:
-                self._json(500, {"error": "custom tomorrow AGENTS.md marker missing from model context"})
-                return
-            report_content = (
-                f"# E2E generated report for {agent_id}\n\n"
-                f"- report_path: {report_path}\n"
-                "- source: 2026-05-22.md\n"
-                "- marker: E2E_DAILY_AGENT_REAL_RUN\n"
-            )
-            message = {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    tool_call(
-                        f"call-write-{agent_id}",
-                        "write_file",
-                        {"path": report_path, "content": report_content},
-                    )
-                ],
-            }
-            finish_reason = "tool_calls"
-
-        self._json(200, {
-            "choices": [{"message": message, "finish_reason": finish_reason}],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
-        })
-
-    def log_message(self, fmt, *args):
-        return
-
-ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+            report_path = match.group(1).strip().strip("` ")
+            path = pathlib.Path(report_path)
+            if not path.is_absolute():
+                path = pathlib.Path.cwd() / path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(report_content(report_path, prompt), encoding="utf-8")
+            message = f"wrote {path.name}"
+        send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":thread_id,"turnId":turn_id,"item":{"id":f"message-{turn_index}","type":"agentMessage","text":message}}})
+        send({"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":thread_id,"turn":{"id":turn_id,"status":"completed"}}})
 PY
-python3 "$DATA_DIR/mock_model.py" "$MOCK_PORT" "$MODEL_LOG" &
-MOCK_PID="$!"
-for _ in {1..60}; do
-  if curl -fsS "http://127.0.0.1:$MOCK_PORT/health" >/dev/null 2>&1; then
+chmod +x "$MOCK_CODEX"
+
+if [[ "${SKIP_BUILD:-false}" != "true" ]]; then
+  SKIP_FRONTEND_BUILD=1 cargo build --bin bifrost
+fi
+
+BIFROST_DATA_DIR="$DATA_DIR" BIFROST_E2E=1 BIFROST_CHATGPT_WEB_E2E_MOCK=1 \
+  BIFROST_CHATGPT_WEB_E2E_MOCK_PLANNING_FIRST=1 \
+  "$BIFROST_BIN" start \
+  --host 127.0.0.1 \
+  -p "$BIFROST_PORT" \
+  --unsafe-ssl \
+  --skip-cert-check \
+  --no-system-proxy \
+  >"$BIFROST_LOG" 2>&1 &
+BIFROST_PID=$!
+
+READY=false
+for _ in $(seq 1 160); do
+  if ! kill -0 "$BIFROST_PID" >/dev/null 2>&1; then
+    exit 1
+  fi
+  if curl -fsS --noproxy '*' "http://127.0.0.1:$BIFROST_PORT/_bifrost/api/proxy/address" >/dev/null 2>&1; then
+    READY=true
     break
   fi
-  sleep 0.2
+  sleep 0.25
 done
-curl -fsS "http://127.0.0.1:$MOCK_PORT/health" >/dev/null
+[[ "$READY" == "true" ]]
 
-SKIP_FRONTEND_BUILD=1 cargo build --bin bifrost
+python3 - "$BIFROST_PORT" "$MOCK_CODEX" "$REPO_DIR" "$DATA_DIR" "$AUDIO_DIR" <<'PY'
+import json
+import pathlib
+import sys
+import time
+import urllib.error
+import urllib.request
 
-BIFROST_DATA_DIR="$DATA_DIR" BIFROST_SYNC_DISABLE_AUTO_LOGIN_PROMPT=1 BIFROST_DISABLE_TRAY=1 "$BIN" start -p "$PORT" --unsafe-ssl --no-system-proxy --skip-cert-check >"$DATA_DIR/server.log" 2>&1 &
-PID="$!"
+port, executable, repo_dir, data_dir, audio_dir = sys.argv[1:]
+base = f"http://127.0.0.1:{port}/_bifrost/api"
 
-for _ in {1..120}; do
-  if curl -fsS "http://127.0.0.1:$PORT/_bifrost/api/asr/capabilities" >/dev/null 2>&1; then
-    break
-  fi
-  sleep 0.5
-done
-curl -fsS "http://127.0.0.1:$PORT/_bifrost/api/asr/capabilities" >/dev/null
+def request(method, path, payload=None, expected=200):
+    expected_statuses = expected if isinstance(expected, tuple) else (expected,)
+    data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        base + path,
+        data=data,
+        headers={"content-type":"application/json"},
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            assert response.status in expected_statuses, response.status
+            return json.loads(response.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as error:
+        body = error.read().decode("utf-8")
+        if error.code in expected_statuses:
+            return json.loads(body or "{}")
+        raise AssertionError((error.code, body)) from error
 
-grep -q "validate_chatgpt_web_tomorrow_todo_response" crates/bifrost-admin/src/handlers/asr_jobs/daily_agent.rs
-grep -q "上一条回复不是最终明日待办" crates/bifrost-admin/src/handlers/asr_jobs/daily_agent.rs
-grep -q "orphaned browser mode mismatch" crates/bifrost-admin/src/im_gateway/chatgpt_web/browser.rs
+request("PATCH", "/im-gateway/chat/config", {
+    "version": 1,
+    "defaultRunnerId": "daily-codex",
+    "runners": {
+        "daily-codex": {
+            "enabled": True,
+            "adapter": "codex",
+            "adapterConfig": {
+                "executable": executable,
+                "transport": "app_server",
+                "sandbox": "read-only",
+                "approvalPolicy": "never",
+                "timeoutSecs": 60,
+            },
+            "injectBifrostTools": False,
+            "skillPaths": [],
+            "workDir": repo_dir,
+            "deliveryMode": "final_reply",
+        },
+        "web-research": {
+            "enabled": True,
+            "adapter": "chatgpt_web",
+            "adapterConfig": {},
+            "injectBifrostTools": False,
+            "skillPaths": [],
+            "deliveryMode": "final_reply",
+        },
+    },
+    "channels": {},
+})
 
-curl -fsS -X PATCH "http://127.0.0.1:$PORT/_bifrost/api/im-gateway/agent" \
-  -H 'content-type: application/json' \
-  -d "{
-    \"enabled\": true,
-    \"model_provider\": \"mock-daily-agent\",
-    \"model\": \"mock-model\",
-    \"base_url\": \"http://127.0.0.1:$MOCK_PORT/chat/completions\",
-    \"api_key\": \"test-key\",
-    \"request_timeout_secs\": 20,
-    \"max_turn_iterations\": 4,
-    \"history\": {\"persistence\": \"none\"},
-    \"memories\": {\"use_memories\": false, \"generate_memories\": false}
-  }" >/dev/null
+task = request("POST", "/asr/tasks", {
+    "name": "daily research external runner e2e",
+    "audio_dir": audio_dir,
+    "enabled": False,
+    "recursive": False,
+    "daily_agent": {"enabled": True},
+}, expected=(200, 201))
+task_id = task["id"]
 
-TASK_JSON="$E2E_DIR/task.json"
-curl -fsS -X POST "http://127.0.0.1:$PORT/_bifrost/api/asr/tasks" \
-  -H 'content-type: application/json' \
-  -d "{\"name\":\"daily agents e2e\",\"audio_dir\":\"$AUDIO_DIR\",\"enabled\":false,\"recursive\":false,\"daily_agent\":{\"enabled\":true}}" > "$TASK_JSON"
-TASK_ID="$(python3 - <<'PY' "$TASK_JSON"
-import json, sys
-print(json.load(open(sys.argv[1]))["id"])
-PY
-)"
+def agent(agent_id, runner, output_dir, dependencies=None, fanout=None):
+    value = {
+        "id": agent_id,
+        "name": agent_id,
+        "enabled": True,
+        "runner": runner,
+        "timeout_ms": 60000,
+        "trigger_policy": "after_asr_run",
+        "instructions_source": "default",
+        "im_delivery": {
+            "enabled": False,
+            "mode": "summary",
+            "send_policy": "on_success_with_report",
+        },
+        "output_dir": output_dir,
+        "dependencies": [
+            {"agent_id": dependency, "include_output": True}
+            for dependency in (dependencies or [])
+        ],
+        "dependency_failure_policy": "skip",
+    }
+    if fanout is not None:
+        value["research_fanout"] = fanout
+    return value
 
-CONFIG_JSON="$E2E_DIR/config.json"
-curl -fsS "http://127.0.0.1:$PORT/_bifrost/api/asr/tasks/$TASK_ID/daily-agent" > "$CONFIG_JSON"
-python3 - <<'PY' "$CONFIG_JSON"
-import json, sys
-body=json.load(open(sys.argv[1]))
-agents=body["config"].get("agents", [])
-assert len(agents)==2, agents
-assert [a["id"] for a in agents] == ["daily_report", "tomorrow_todo"], agents
-assert agents[0]["output_dir"] == "report", agents
-assert agents[1]["output_dir"] == "tomorrow_todo", agents
-assert agents[1]["im_delivery"]["enabled"] is True, agents[1]
-assert agents[1]["im_delivery"]["channel"] == "owner:feishu-main", agents[1]
-PY
-
-TASK_TEXT_DIR="$DATA_DIR/asr/data/text/$TASK_ID"
-DAILY_DIR="$TASK_TEXT_DIR/.daily"
-AGENTS_DIR="$DAILY_DIR/agents"
-REPORT_DIR="$AGENTS_DIR/daily_report/output/report"
-TODO_DIR="$AGENTS_DIR/tomorrow_todo/output/tomorrow_todo"
-test -d "$AGENTS_DIR/daily_report"
-test -d "$AGENTS_DIR/tomorrow_todo"
-test -d "$AGENTS_DIR/daily_report/input"
-test -d "$AGENTS_DIR/tomorrow_todo/input"
-test -d "$REPORT_DIR"
-test -d "$TODO_DIR"
-test -f "$AGENTS_DIR/daily_report/AGENTS.md"
-test -f "$AGENTS_DIR/tomorrow_todo/AGENTS.md"
-grep -q "明日 To Do List" "$AGENTS_DIR/tomorrow_todo/AGENTS.md"
-
-CONFIG_UPDATE_JSON="$E2E_DIR/config_update.json"
-python3 - <<'PY' "$CONFIG_JSON" "$CONFIG_UPDATE_JSON" "$SYNC_DIR"
-import json, sys
-body=json.load(open(sys.argv[1]))
-config=body["config"]
-for agent in config["agents"]:
-    agent["runner"]="bifrost_agent"
-    agent["timeout_ms"]=60000
-    agent.setdefault("im_delivery", {})["enabled"]=False
-payload={
+# Deliberately reverse the stored array; execution must still use the DAG.
+agents = [
+    agent("research_digest", "daily-codex", "research_digest", ["research_fanout"]),
+    agent(
+        "research_fanout",
+        "web-research",
+        "research_result",
+        ["research_dispatcher"],
+        {
+            "max_questions": 8,
+            "chatgpt_project_url": "https://chatgpt.com/g/g-p-daily-research/project",
+            "allowed_runners": ["web-research"],
+            "context_profiles": {},
+        },
+    ),
+    agent("research_dispatcher", "daily-codex", "research_dispatcher", ["research_seed"]),
+    agent("research_seed", "daily-codex", "research_seed", ["daily_report"]),
+    agent("daily_report", "daily-codex", "report"),
+]
+updated = request("PUT", f"/asr/tasks/{task_id}/daily-agent", {
     "enabled": True,
-    "agents": config["agents"],
-    "runner": "bifrost_agent",
-    "timeout_ms": 60000,
-    "terminology": "Jennie = Daily Agent 专有项目名\nQwen3-ASR = 语音识别模型\nE2E_TERMS_MARKER",
-    "report_sync_dir": sys.argv[3],
+    "agents": agents,
+})
+stored = {item["id"]: item for item in updated["config"]["agents"]}
+assert stored["research_fanout"]["research_fanout"]["chatgpt_interface_mode"] == "chat", stored
+assert stored["research_fanout"]["research_fanout"]["chatgpt_model"] == "pro", stored
+
+invalid = list(agents)
+invalid[0] = dict(invalid[0], dependencies=[{"agent_id":"missing-agent","include_output":True}])
+rejected = request("PUT", f"/asr/tasks/{task_id}/daily-agent", {"agents":invalid}, expected=400)
+assert "missing-agent" in json.dumps(rejected), rejected
+
+date = "2026-07-13"
+daily_dir = pathlib.Path(data_dir) / "asr" / "data" / "text" / task_id / ".daily"
+daily_dir.mkdir(parents=True, exist_ok=True)
+(daily_dir / f"{date}.md").write_text(
+    "# 2026-07-13\n\n"
+    "帮我记录一下并研究 IBKR 成交成本。\n"
+    "另一个问题：日报研究问题如何做到每题独立会话？\n"
+    "帮我记录一下修复线上超时并查询 Trace。\n",
+    encoding="utf-8",
+)
+queued = request(
+    "POST",
+    f"/asr/tasks/{task_id}/daily-agent/run?date={date}&force=1",
+    expected=(200, 202),
+)
+assert queued["status"] in ("queued", "already_running"), queued
+
+runs = None
+expected_agents = {
+    "daily_report",
+    "research_seed",
+    "research_dispatcher",
+    "research_fanout",
+    "research_digest",
 }
-json.dump(payload, open(sys.argv[2], "w"), ensure_ascii=False)
-PY
-curl -fsS -X PUT "http://127.0.0.1:$PORT/_bifrost/api/asr/tasks/$TASK_ID/daily-agent" \
-  -H 'content-type: application/json' \
-  -d @"$CONFIG_UPDATE_JSON" >/dev/null
-curl -fsS "http://127.0.0.1:$PORT/_bifrost/api/asr/tasks/$TASK_ID/daily-agent" > "$E2E_DIR/config_after_terms.json"
-python3 - <<'PY' "$E2E_DIR/config_after_terms.json"
-import json, sys
-body=json.load(open(sys.argv[1]))
-assert body["config"]["terminology"].startswith("Jennie = Daily Agent"), body["config"]
-PY
-grep -q "E2E_TERMS_MARKER" "$AGENTS_DIR/daily_report/TERMS.md"
-grep -q "E2E_TERMS_MARKER" "$AGENTS_DIR/tomorrow_todo/TERMS.md"
-grep -q '`TERMS.md`' "$AGENTS_DIR/daily_report/AGENTS.md"
-grep -q '`TERMS.md`' "$AGENTS_DIR/tomorrow_todo/AGENTS.md"
+for _ in range(180):
+    runs = request("GET", f"/asr/tasks/{task_id}/daily-agent/runs")
+    docs = {
+        item["agent_id"]: item
+        for item in runs.get("processed_documents", [])
+        if item.get("date") == date
+    }
+    if set(docs) == expected_agents:
+        break
+    time.sleep(0.5)
+else:
+    raise AssertionError(runs)
 
-CUSTOM_INSTRUCTIONS="$E2E_DIR/tomorrow_agents.md"
-cat > "$CUSTOM_INSTRUCTIONS" <<'MD'
-# E2E Custom Tomorrow Agent
+order = [item["agent_id"] for item in runs["processed_documents"] if item.get("date") == date]
+assert set(order) == expected_agents, order
+fanout_dir = daily_dir / "agents" / "research_fanout" / "output" / "research_result"
+children_dir = fanout_dir / date
+manifest = json.loads((children_dir / "manifest.json").read_text(encoding="utf-8"))
+assert len(manifest["questions"]) == 2, manifest
+assert "修复线上超时" not in json.dumps(manifest, ensure_ascii=False), manifest
 
-E2E_CUSTOM_TOMORROW_AGENT_MARKER
+seed_path = daily_dir / "agents" / "research_seed" / "output" / "research_seed" / f"{date}-report.md"
+seed_report = seed_path.read_text(encoding="utf-8")
+assert '"classification":"internal_investigation"' in seed_report, seed_report
 
-Write a concise tomorrow todo report for changed daily markdown files.
-MD
-CUSTOM_PAYLOAD="$E2E_DIR/tomorrow_agents_payload.json"
-python3 - <<'PY' "$CUSTOM_INSTRUCTIONS" "$CUSTOM_PAYLOAD"
-import json, sys
-json.dump({"content": open(sys.argv[1], encoding="utf-8").read()}, open(sys.argv[2], "w"), ensure_ascii=False)
-PY
-curl -fsS -X PUT "http://127.0.0.1:$PORT/_bifrost/api/asr/tasks/$TASK_ID/daily-agent/agents?agent_id=tomorrow_todo" \
-  -H 'content-type: application/json' \
-  -d @"$CUSTOM_PAYLOAD" >/dev/null
-grep -q "E2E_CUSTOM_TOMORROW_AGENT_MARKER" "$AGENTS_DIR/tomorrow_todo/AGENTS.md"
-
-mkdir -p "$DAILY_DIR"
-cat > "$DAILY_DIR/2026-05-22.md" <<'MD'
-# 2026-05-22
-今天讨论了发布计划，并明确明天需要整理上线 checklist。
-MD
-
-RUN_JSON="$E2E_DIR/run_response.json"
-curl -fsS -X POST "http://127.0.0.1:$PORT/_bifrost/api/asr/tasks/$TASK_ID/daily-agent/run?date=2026-05-22&force=1" > "$RUN_JSON"
-python3 - <<'PY' "$RUN_JSON"
-import json, sys
-body=json.load(open(sys.argv[1]))
-assert body["status"] in ("queued", "already_running"), body
-assert body.get("date") == "2026-05-22", body
-PY
-
-RUNS_JSON="$E2E_DIR/runs.json"
-RUN_DONE=0
-for _ in {1..120}; do
-  curl -fsS "http://127.0.0.1:$PORT/_bifrost/api/asr/tasks/$TASK_ID/daily-agent/runs" > "$RUNS_JSON"
-  if python3 - <<'PY' "$RUNS_JSON" "$REPORT_DIR/2026-05-22-report.md" "$TODO_DIR/2026-05-22-report.md"
-import json, pathlib, sys
-body=json.load(open(sys.argv[1]))
-docs=[
-    d for d in body.get("processed_documents", [])
-    if d.get("date") == "2026-05-22" and d.get("agent_id") in {"daily_report", "tomorrow_todo"}
+github = json.loads((children_dir / "github-question.json").read_text(encoding="utf-8"))
+product = json.loads((children_dir / "product-question.json").read_text(encoding="utf-8"))
+github_report = (children_dir / "github-question.md").read_text(encoding="utf-8")
+product_report = (children_dir / "product-question.md").read_text(encoding="utf-8")
+assert github["original_question"] == "IBKR 仓库如何计算成交成本？", github
+assert product["original_question"] == "日报研究问题如何做到每题独立会话？", product
+assert github["conversation_id"] != product["conversation_id"], (github, product)
+assert github["full_report_link"].startswith("https://chatgpt.com/c/"), github
+assert product["full_report_link"].startswith("https://chatgpt.com/c/"), product
+assert github["github_connector_status"] == "missing", github
+for report in (github_report, product_report):
+    assert "## 原始问题" in report, report
+    assert "## 核心结论" in report, report
+    assert "## 事实与证据" in report, report
+    assert "## 推断与不确定性" in report, report
+    assert "## 对原始问题的直接回答" in report, report
+wait_prompts = [
+    path
+    for path in (pathlib.Path(data_dir) / "im_gateway" / "runs").glob("*/prompt.md")
+    if not path.read_text(encoding="utf-8").strip()
 ]
-if len({d.get("agent_id") for d in docs}) != 2:
-    raise SystemExit(1)
-for path in sys.argv[2:]:
-    text=pathlib.Path(path).read_text(encoding="utf-8")
-    assert "E2E_DAILY_AGENT_REAL_RUN" in text, text
-PY
-  then
-    RUN_DONE=1
-    break
-  fi
-  sleep 1
-done
-if [[ "$RUN_DONE" != "1" ]]; then
-  curl -fsS "http://127.0.0.1:$PORT/_bifrost/api/asr/tasks/$TASK_ID/daily-agent" > "$E2E_DIR/final_config.json" || true
-  cat "$RUNS_JSON" >&2 || true
-  cat "$E2E_DIR/final_config.json" >&2 || true
-  exit 1
-fi
-
-python3 - <<'PY' "$RUNS_JSON"
-import json, sys
-body=json.load(open(sys.argv[1]))
-docs=[d for d in body["processed_documents"] if d["date"]=="2026-05-22"]
-assert len(docs)==2, docs
-assert {d["agent_id"] for d in docs} == {"daily_report", "tomorrow_todo"}, docs
-assert {d["output_dir"] for d in docs} == {"report", "tomorrow_todo"}, docs
-assert {d["runner"] for d in docs} == {"bifrost_agent"}, docs
-assert len({(d["agent_id"], d["date"]) for d in docs}) == 2, docs
-for doc in docs:
-    assert "/.daily/agents/" in doc.get("report_path", ""), doc
-PY
-grep -q "E2E_DAILY_AGENT_REAL_RUN" "$REPORT_DIR/2026-05-22-report.md"
-grep -q "E2E_DAILY_AGENT_REAL_RUN" "$TODO_DIR/2026-05-22-report.md"
-grep -q "E2E_DAILY_AGENT_REAL_RUN" "$SYNC_DIR/daily_report/2026-05-22-report.md"
-grep -q "E2E_DAILY_AGENT_REAL_RUN" "$SYNC_DIR/tomorrow_todo/2026-05-22-report.md"
-test ! -f "$SYNC_DIR/2026-05-22-report.md"
-grep -q "整理上线 checklist" "$AGENTS_DIR/daily_report/input/2026-05-22.md"
-grep -q "整理上线 checklist" "$AGENTS_DIR/tomorrow_todo/input/2026-05-22.md"
-test ! -f "$DAILY_DIR/report/2026-05-22-report.md"
-test ! -f "$DAILY_DIR/tomorrow_todo/2026-05-22-report.md"
-
-TODO_REPORT_JSON="$E2E_DIR/todo_report.json"
-curl -fsS "http://127.0.0.1:$PORT/_bifrost/api/asr/tasks/$TASK_ID/daily-agent/reports/2026-05-22?agent_id=tomorrow_todo" > "$TODO_REPORT_JSON"
-python3 - <<'PY' "$TODO_REPORT_JSON"
-import json, sys
-body=json.load(open(sys.argv[1]))
-assert body["agent_id"] == "tomorrow_todo", body
-assert body["output_dir"] == "tomorrow_todo", body
-assert "E2E_DAILY_AGENT_REAL_RUN" in body["content"], body
-assert "/.daily/agents/tomorrow_todo/output/tomorrow_todo/" in body["path"], body
-PY
-
-SYNC_STATUS_JSON="$E2E_DIR/sync_status.json"
-curl -fsS "http://127.0.0.1:$PORT/_bifrost/api/asr/tasks/$TASK_ID/daily-agent" > "$SYNC_STATUS_JSON"
-python3 - <<'PY' "$SYNC_STATUS_JSON" "$SYNC_DIR"
-import json, os, pathlib, sys
-body=json.load(open(sys.argv[1]))
-sync_root=pathlib.Path(sys.argv[2])
-agents={agent["id"]: agent for agent in body["config"]["agents"]}
-assert os.path.normpath(agents["daily_report"]["last_report_sync"]["target_dir"]) == os.path.normpath(sync_root / "daily_report"), agents["daily_report"]
-assert os.path.normpath(agents["tomorrow_todo"]["last_report_sync"]["target_dir"]) == os.path.normpath(sync_root / "tomorrow_todo"), agents["tomorrow_todo"]
-assert agents["daily_report"]["last_report_sync"]["total_files"] == 1, agents["daily_report"]
-assert agents["tomorrow_todo"]["last_report_sync"]["total_files"] == 1, agents["tomorrow_todo"]
-PY
-
-INSTR_JSON="$E2E_DIR/todo_instructions.json"
-curl -fsS "http://127.0.0.1:$PORT/_bifrost/api/asr/tasks/$TASK_ID/daily-agent/agents?agent_id=tomorrow_todo" > "$INSTR_JSON"
-python3 - <<'PY' "$INSTR_JSON"
-import json, sys
-body=json.load(open(sys.argv[1]))
-assert body["agent_id"] == "tomorrow_todo", body
-assert "E2E_CUSTOM_TOMORROW_AGENT_MARKER" in body["content"], body
-assert body["source"] == "file", body
-PY
-
-python3 - <<'PY' "$MODEL_LOG"
-import json, sys
-lines=[json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
-assert len(lines) >= 4, len(lines)
-dump="\n".join(json.dumps(line, ensure_ascii=False) for line in lines)
-assert "E2E_CUSTOM_TOMORROW_AGENT_MARKER" in dump, "custom AGENTS.md marker never reached model context"
-assert "TERMS.md" in dump, "terminology relative file reference missing from model context"
-assert "output/report/2026-05-22-report.md" in dump, "daily_report target missing from model prompt"
-assert "output/tomorrow_todo/2026-05-22-report.md" in dump, "tomorrow_todo target missing from model prompt"
-PY
-
-RUN_IDS_BEFORE_APPEND="$E2E_DIR/run_ids_before_append.json"
-python3 - <<'PY' "$RUNS_JSON" "$RUN_IDS_BEFORE_APPEND"
-import json, sys
-body=json.load(open(sys.argv[1]))
-docs=[
-    d for d in body.get("processed_documents", [])
-    if d.get("date") == "2026-05-22" and d.get("agent_id") in {"daily_report", "tomorrow_todo"}
+assert len(wait_prompts) >= 2, wait_prompts
+retry_prompts = [
+    path
+    for path in (pathlib.Path(data_dir) / "im_gateway" / "runs").glob("*/prompt.md")
+    if "上一条回复不是最终研究报告"
+    in path.read_text(encoding="utf-8")
 ]
-assert len({d.get("agent_id") for d in docs}) == 2, docs
-json.dump({d["agent_id"]: d["last_run_id"] for d in docs}, open(sys.argv[2], "w"), ensure_ascii=False)
+assert len(retry_prompts) >= 2, retry_prompts
+
+fanout_report = (fanout_dir / f"{date}-report.md").read_text(encoding="utf-8")
+assert github["full_report_link"] in fanout_report, fanout_report
+assert product["full_report_link"] in fanout_report, fanout_report
+digest_upstream = daily_dir / "agents" / "research_digest" / "input" / "upstream" / "research_fanout" / f"{date}-report.md"
+digest_input = digest_upstream.read_text(encoding="utf-8")
+assert github["full_report_link"] in digest_input, digest_input
+assert product["full_report_link"] in digest_input, digest_input
+digest_path = daily_dir / "agents" / "research_digest" / "output" / "research_digest" / f"{date}-report.md"
+digest = digest_path.read_text(encoding="utf-8")
+assert github["full_report_link"] in digest, digest
+assert product["full_report_link"] in digest, digest
+
+empty_date = "2026-07-14"
+(daily_dir / f"{empty_date}.md").write_text(
+    "# 2026-07-14\n\n帮我记录一下修复线上超时。\n",
+    encoding="utf-8",
+)
+queued = request(
+    "POST",
+    f"/asr/tasks/{task_id}/daily-agent/run?date={empty_date}&force=1",
+    expected=(200, 202),
+)
+assert queued["status"] in ("queued", "already_running"), queued
+
+empty_runs = None
+for _ in range(180):
+    empty_runs = request("GET", f"/asr/tasks/{task_id}/daily-agent/runs")
+    empty_docs = {
+        item["agent_id"]: item
+        for item in empty_runs.get("processed_documents", [])
+        if item.get("date") == empty_date
+    }
+    if set(empty_docs) == expected_agents:
+        break
+    time.sleep(0.5)
+else:
+    raise AssertionError(empty_runs)
+
+empty_children_dir = fanout_dir / empty_date
+empty_manifest = json.loads(
+    (empty_children_dir / "manifest.json").read_text(encoding="utf-8")
+)
+assert empty_manifest["questions"] == [], empty_manifest
+assert list(empty_children_dir.glob("*.json")) == [empty_children_dir / "manifest.json"]
+empty_fanout_report = (
+    fanout_dir / f"{empty_date}-report.md"
+).read_text(encoding="utf-8")
+assert "本日报未识别到需要外部研究的问题" in empty_fanout_report, empty_fanout_report
+empty_digest_upstream = (
+    daily_dir
+    / "agents"
+    / "research_digest"
+    / "input"
+    / "upstream"
+    / "research_fanout"
+    / f"{empty_date}-report.md"
+).read_text(encoding="utf-8")
+assert "本日报未识别到需要外部研究的问题" in empty_digest_upstream
+empty_digest = (
+    daily_dir
+    / "agents"
+    / "research_digest"
+    / "output"
+    / "research_digest"
+    / f"{empty_date}-report.md"
+).read_text(encoding="utf-8")
+assert "本日报未识别到需要外部研究的问题" in empty_digest
+
+print(f"[asr-daily-agents] PASS task={task_id}")
 PY
-
-cat >> "$DAILY_DIR/2026-05-22.md" <<'MD'
-
-新增明日跟进动作：确认追加后的 daily markdown 会在非 force 运行中被识别为 Appended。
-MD
-
-APPEND_RUN_JSON="$E2E_DIR/run_response_appended.json"
-curl -fsS -X POST "http://127.0.0.1:$PORT/_bifrost/api/asr/tasks/$TASK_ID/daily-agent/run?date=2026-05-22" > "$APPEND_RUN_JSON"
-python3 - <<'PY' "$APPEND_RUN_JSON"
-import json, sys
-body=json.load(open(sys.argv[1]))
-assert body["status"] in ("queued", "already_running"), body
-assert body.get("date") == "2026-05-22", body
-PY
-
-APPENDED_RUN_DONE=0
-for _ in {1..120}; do
-  curl -fsS "http://127.0.0.1:$PORT/_bifrost/api/asr/tasks/$TASK_ID/daily-agent/runs" > "$RUNS_JSON"
-  if python3 - <<'PY' "$RUNS_JSON" "$RUN_IDS_BEFORE_APPEND" "$REPORT_DIR/2026-05-22-report.md" "$TODO_DIR/2026-05-22-report.md"
-import json, pathlib, sys
-body=json.load(open(sys.argv[1]))
-before=json.load(open(sys.argv[2]))
-docs=[
-    d for d in body.get("processed_documents", [])
-    if d.get("date") == "2026-05-22" and d.get("agent_id") in {"daily_report", "tomorrow_todo"}
-]
-if len({d.get("agent_id") for d in docs}) != 2:
-    raise SystemExit(1)
-for doc in docs:
-    if doc.get("last_run_id") == before.get(doc.get("agent_id")):
-        raise SystemExit(1)
-for path in sys.argv[3:]:
-    text=pathlib.Path(path).read_text(encoding="utf-8")
-    assert "E2E_DAILY_AGENT_REAL_RUN" in text, text
-PY
-  then
-    APPENDED_RUN_DONE=1
-    break
-  fi
-  sleep 1
-done
-if [[ "$APPENDED_RUN_DONE" != "1" ]]; then
-  curl -fsS "http://127.0.0.1:$PORT/_bifrost/api/asr/tasks/$TASK_ID/daily-agent" > "$E2E_DIR/final_config_after_append.json" || true
-  cat "$RUNS_JSON" >&2 || true
-  cat "$E2E_DIR/final_config_after_append.json" >&2 || true
-  exit 1
-fi
-
-python3 - <<'PY' "$MODEL_LOG"
-import json, sys
-lines=[json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
-dump="\n".join(json.dumps(line, ensure_ascii=False) for line in lines)
-assert "change_kind=Appended" in dump, "appended daily markdown did not reach model prompt"
-PY
-
-echo "ASR daily agents API E2E passed: task=$TASK_ID data_dir=$DATA_DIR"
