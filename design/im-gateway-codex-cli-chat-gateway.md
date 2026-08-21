@@ -230,6 +230,8 @@ $BIFROST_DATA_DIR/im_gateway/chat_runs/<run_id>/
 
 `session_state.json` 按 `sessionKey + adapter + runnerId` scope 保存 threadId 与 modelOverride，用于跨轮 resume。FIFO queue 归主 Bifrost Service 的 `SessionQueueManager` 所有，不依赖隔离 worker 内存；运行中收到的普通后续消息默认入队，当前 turn 完成后作为独立下一轮执行，`/q` 继续提供显式排队与序号管理。只有显式 `/g` 才尝试运行中引导：Codex/Traex app-server 通过 `turn/steer` 接收 Guide，Claude Code 与自定义/exec transport 先请求 active worker capability，无法注入时完整降级 queue。ChatGPT Web 不提供 `/g`。
 
+跨 session 的 External CLI 调度默认最多同时运行 4 个隔离 worker，并允许最多 16 个请求有界等待。coding-agent 任务可能运行数分钟或更久，因此排队项默认等待到获得运行槽位，或被 `/stop`、Service shutdown 取消，不使用短时请求 deadline 误杀健康会话；超过 queue capacity 时立即拒绝。运维需要硬 deadline 时可显式设置 `BIFROST_EXTERNAL_CLI_QUEUE_TIMEOUT_SECS`（最大 600 秒），并可用 `BIFROST_EXTERNAL_CLI_MAX_CONCURRENCY`（最大 16）和 `BIFROST_EXTERNAL_CLI_QUEUE_CAPACITY`（最大 64）调整资源边界。
+
 运行中的 `/model <name>` 与 `/model clear` 先更新同一份 session override，再经 IM worker → 主进程 capability broker → external worker 控制通道更新原生会话。Codex 与 Traex app-server 使用 `thread/settings/update {threadId, model}`；Claude Code stream-json 使用 `control_request {subtype:"set_model", model}`。原生 ACK 只表示新模型对后续响应/轮次生效，不中断或重启已经发出的生成。`/model`、`/models` 查询在运行中同样可用。自定义 `exec` transport 没有原生热切换协议时，override 仍持久化供下一次 run 使用，并向用户明确报告当前 Runner 未确认热切换。
 
 IM progress card 的模型展示以本次 session/thread 的有效模型为准，不把 session override 重新标记为 Runner 配置。运行中模型更新只有在原生 ACK 成功后才刷新当前卡片；后续 token、额度、状态或终态摘要刷新必须保留该 thread 的动态模型，不能再用启动时的 Runner 配置覆盖。原生更新被拒绝时，当前卡片继续展示实际运行模型，已持久化的 override 只在下一次 run 生效。

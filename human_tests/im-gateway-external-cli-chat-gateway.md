@@ -1806,7 +1806,38 @@
 3. 后续 token、额度、状态和终态刷新继续更新其他 Runner 字段，但不会覆盖当前 thread 的动态模型。
 4. `/model clear` ACK 成功后，当前卡片展示 Codex 默认模型，而不是启动时或 Runner 配置中的旧模型。
 
+### TC-IEC-77: External CLI 跨 Session 有界排队不被短 deadline 误杀
+
+前置条件：
+
+1. 使用隔离数据目录、动态端口和 mock External Runner；不得连接真实飞书服务或重启用户现有 Service。
+2. 保持默认运行并发 4、等待队列容量 16，并确保未设置 `BIFROST_EXTERNAL_CLI_QUEUE_TIMEOUT_SECS`。
+
+操作步骤：
+
+1. 同时启动 4 个不同 session 的 mock coding-agent 长任务，确认四个隔离 worker 均已进入运行态并占满运行槽位。
+2. 在第五个 session 发起普通消息，让它等待超过旧版 30 秒 queue timeout；释放运行槽位后确认第五个任务启动并完成。
+3. 执行 focused Rust 回归，覆盖默认无 deadline、排队取消优先、queue capacity 拒绝和显式 deadline：
+   ```bash
+   SKIP_FRONTEND_BUILD=1 cargo test -p bifrost-admin external_cli_queue_ --lib -- --nocapture
+   ```
+4. 使用当前源码构建的二进制执行隔离 Service E2E：
+   ```bash
+   SKIP_BUILD=true BIFROST_BIN="$PWD/target/debug/bifrost" \
+     bash e2e-tests/tests/test_external_runner_queue_capacity.sh
+   ```
+5. 安装通过验证的 release 二进制后，在真实飞书群对已 `/resume` 的 Traex session 发送下一条普通消息，并检查 IM message log 与 session state。
+
+预期结果：
+
+1. 第五个 session 等待超过 30 秒后仍会在槽位释放时启动，不再返回 `external CLI queue timed out after 30 seconds`。
+2. 排队任务可被 `/stop` 或 Service shutdown 取消；取消与槽位同时 ready 时必须以取消优先，不得启动已取消 worker。
+3. 等待项超过 16 个时立即返回 queue full；显式配置 queue timeout 时仍按配置超时，且上限为 600 秒。
+4. 真实飞书恢复会话的下一轮普通消息进入原 Traex session 并正常响应，IM 日志中不再出现 30 秒 queue timeout。
+
 ## 最近执行记录
+
+- 2026-08-21：TC-IEC-77 隔离链路 PASS，真实飞书链路待正式安装后复测。focused Rust 回归 6/6 通过，覆盖默认无 deadline、取消与槽位同时 ready 时取消优先、queue capacity、显式 deadline 和配置边界；当前源码 debug 二进制执行 `test_external_runner_queue_capacity.sh` 输出 `[external-runner-queue-capacity] PASS (32s queued wait)`。隔离 Service 的 4 个不同 session 占满默认运行槽位，第五个 session 等待跨过旧版 30 秒 deadline 后启动并返回 `BIFROST_EXTERNAL_QUEUE_OK`；测试使用动态端口和临时数据目录，未连接真实飞书、未停止或重启正式 9900 Service。
 
 - 2026-08-19：PASS — 复跑 TC-IEC-75。先以 `RUST_TEST_THREADS=1 make coverage-changed` 完成包含 live model channel、IM broker、Codex/Traex app-server 与 Claude Code stream-json 的完整 Rust 回归，再使用当前源码构建的二进制执行 `SKIP_BUILD=true BIFROST_BIN="$PWD/target/debug/bifrost" bash e2e-tests/tests/test_im_gateway_live_model_switch.sh`，输出 `[im-live-model] PASS`。隔离 Service + mock 飞书入站在同一个运行中 Codex turn 依次发送 `/model gpt-live-unit` 与 `/model clear`，mock app-server 收到同一 `threadId` 的 model 字符串和 `null` 更新；当前 turn 正常结束、session override 最终清除。脚本使用动态端口和临时数据目录，未连接真实飞书、未触碰正式 `9900` 服务，并通过 trap 清理测试进程。
 
