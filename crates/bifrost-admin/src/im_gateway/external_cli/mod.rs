@@ -91,7 +91,11 @@ const EXTERNAL_CLI_WORKER_HEARTBEAT_TIMEOUT_SECS: u64 = 45;
 // keeping the isolated worker fan-out bounded. A single global slot lets one
 // long-running agent block every unrelated IM conversation.
 const DEFAULT_EXTERNAL_CLI_MAX_CONCURRENCY: usize = 4;
-const DEFAULT_EXTERNAL_CLI_QUEUE_TIMEOUT_SECS: u64 = 30;
+// Coding-agent runs commonly outlive a short request timeout. Keep waiting
+// bounded by queue capacity and explicit cancellation instead of failing an
+// otherwise healthy fifth conversation after 30 seconds. Operators may still
+// opt into a queue deadline with BIFROST_EXTERNAL_CLI_QUEUE_TIMEOUT_SECS.
+const DEFAULT_EXTERNAL_CLI_QUEUE_CAPACITY: usize = 16;
 pub const EXTERNAL_CLI_PROGRESS_CHANNEL_CAPACITY: usize = 256;
 const CODEX_WEEKLY_WINDOW_MINUTES: u64 = 7 * 24 * 60;
 #[cfg(unix)]
@@ -112,6 +116,8 @@ static QUEUED_WORKER_SESSIONS: once_cell::sync::Lazy<
 > = once_cell::sync::Lazy::new(dashmap::DashMap::new);
 static EXTERNAL_CLI_RUN_SEMAPHORE: once_cell::sync::Lazy<tokio::sync::Semaphore> =
     once_cell::sync::Lazy::new(|| tokio::sync::Semaphore::new(external_cli_max_concurrency()));
+static EXTERNAL_CLI_QUEUE_SEMAPHORE: once_cell::sync::Lazy<tokio::sync::Semaphore> =
+    once_cell::sync::Lazy::new(|| tokio::sync::Semaphore::new(external_cli_queue_capacity()));
 static ACTIVE_WORKERS: once_cell::sync::Lazy<
     dashmap::DashMap<u32, mpsc::UnboundedSender<oneshot::Sender<()>>>,
 > = once_cell::sync::Lazy::new(dashmap::DashMap::new);
@@ -148,6 +154,75 @@ impl Drop for QueuedExternalCliWorkerGuard {
         };
         QUEUED_WORKER_SESSIONS.remove_if(session_key, |_, entry| entry.queue_id == self.queue_id);
     }
+}
+
+async fn acquire_external_cli_run_permit<'a>(
+    run_semaphore: &'a tokio::sync::Semaphore,
+    queue_semaphore: &'a tokio::sync::Semaphore,
+    queue_capacity: usize,
+    control_key: Option<String>,
+    queue_timeout_secs: Option<u64>,
+) -> Result<tokio::sync::SemaphorePermit<'a>, String> {
+    match run_semaphore.try_acquire() {
+        Ok(permit) => return Ok(permit),
+        Err(tokio::sync::TryAcquireError::Closed) => {
+            return Err("external CLI concurrency semaphore is closed".to_string());
+        }
+        Err(tokio::sync::TryAcquireError::NoPermits) => {}
+    }
+
+    let _queue_permit = queue_semaphore.try_acquire().map_err(|error| match error {
+        tokio::sync::TryAcquireError::NoPermits => {
+            format!("external CLI queue is full (capacity {queue_capacity})")
+        }
+        tokio::sync::TryAcquireError::Closed => {
+            "external CLI queue semaphore is closed".to_string()
+        }
+    })?;
+    let queue_id = uuid::Uuid::new_v4().to_string();
+    let (queue_cancel_tx, mut queue_cancel_rx) = watch::channel(false);
+    let queue_guard = QueuedExternalCliWorkerGuard {
+        session_key: control_key.clone(),
+        queue_id: queue_id.clone(),
+    };
+    if let Some(session_key) = control_key.as_deref() {
+        QUEUED_WORKER_SESSIONS.insert(
+            session_key.to_string(),
+            QueuedExternalCliWorkerControl {
+                queue_id,
+                cancel_tx: queue_cancel_tx,
+            },
+        );
+    }
+
+    let acquire = run_semaphore.acquire();
+    tokio::pin!(acquire);
+    let queue_timeout = async move {
+        match queue_timeout_secs {
+            Some(seconds) => tokio::time::sleep(Duration::from_secs(seconds)).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(queue_timeout);
+    let permit = tokio::select! {
+        biased;
+        changed = queue_cancel_rx.changed() => {
+            if changed.is_ok() && *queue_cancel_rx.borrow() {
+                return Err("external CLI run cancelled while queued".to_string());
+            }
+            return Err("external CLI queue cancellation channel closed".to_string());
+        }
+        result = &mut acquire => result
+            .map_err(|_| "external CLI concurrency semaphore is closed".to_string())?,
+        _ = &mut queue_timeout => {
+            return Err(format!(
+                "external CLI queue timed out after {} seconds",
+                queue_timeout_secs.expect("queue timeout future only completes when configured")
+            ));
+        }
+    };
+    drop(queue_guard);
+    Ok(permit)
 }
 
 struct ActiveWorkerRegistration {
@@ -2251,46 +2326,18 @@ impl ExternalCliRuntime {
         if let Some(session_key) = request.session_key.as_deref() {
             let _ = request_worker_session_stop(session_key).await;
         }
-        let queue_timeout_secs = external_cli_queue_timeout_secs();
-        let queue_id = uuid::Uuid::new_v4().to_string();
         let control_key = request
             .session_key
             .clone()
             .or_else(|| registry_id.map(str::to_string));
-        let (queue_cancel_tx, mut queue_cancel_rx) = watch::channel(false);
-        let queue_guard = QueuedExternalCliWorkerGuard {
-            session_key: control_key.clone(),
-            queue_id: queue_id.clone(),
-        };
-        if let Some(session_key) = control_key.as_deref() {
-            QUEUED_WORKER_SESSIONS.insert(
-                session_key.to_string(),
-                QueuedExternalCliWorkerControl {
-                    queue_id,
-                    cancel_tx: queue_cancel_tx,
-                },
-            );
-        }
-        let acquire = EXTERNAL_CLI_RUN_SEMAPHORE.acquire();
-        tokio::pin!(acquire);
-        let queue_timeout = tokio::time::sleep(Duration::from_secs(queue_timeout_secs));
-        tokio::pin!(queue_timeout);
-        let _run_permit = tokio::select! {
-            result = &mut acquire => result
-                .map_err(|_| "external CLI concurrency semaphore is closed".to_string())?,
-            _ = &mut queue_timeout => {
-                return Err(format!(
-                    "external CLI queue timed out after {queue_timeout_secs} seconds"
-                ));
-            }
-            changed = queue_cancel_rx.changed() => {
-                if changed.is_ok() && *queue_cancel_rx.borrow() {
-                    return Err("external CLI run cancelled while queued".to_string());
-                }
-                return Err("external CLI queue cancellation channel closed".to_string());
-            }
-        };
-        drop(queue_guard);
+        let _run_permit = acquire_external_cli_run_permit(
+            &EXTERNAL_CLI_RUN_SEMAPHORE,
+            &EXTERNAL_CLI_QUEUE_SEMAPHORE,
+            external_cli_queue_capacity(),
+            control_key.clone(),
+            external_cli_queue_timeout_secs(),
+        )
+        .await?;
         if let Some(registry_id) = registry_id {
             crate::worker_runtime::mark_worker_job_running(registry_id);
         }
@@ -6186,13 +6233,21 @@ fn external_cli_max_concurrency() -> usize {
         .unwrap_or(DEFAULT_EXTERNAL_CLI_MAX_CONCURRENCY)
 }
 
-fn external_cli_queue_timeout_secs() -> u64 {
+fn external_cli_queue_capacity() -> usize {
+    std::env::var("BIFROST_EXTERNAL_CLI_QUEUE_CAPACITY")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(64))
+        .unwrap_or(DEFAULT_EXTERNAL_CLI_QUEUE_CAPACITY)
+}
+
+fn external_cli_queue_timeout_secs() -> Option<u64> {
     std::env::var("BIFROST_EXTERNAL_CLI_QUEUE_TIMEOUT_SECS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|value| *value > 0)
         .map(|value| value.min(600))
-        .unwrap_or(DEFAULT_EXTERNAL_CLI_QUEUE_TIMEOUT_SECS)
 }
 
 fn compact_external_cli_worker_progress(

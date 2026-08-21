@@ -673,6 +673,170 @@ async fn sessionless_registry_job_can_cancel_while_queued() {
 }
 
 #[tokio::test]
+async fn external_cli_queue_waits_for_a_run_slot_without_a_default_deadline() {
+    let _registry_guard = external_cli_env_guard_async().await;
+    let run_semaphore = tokio::sync::Semaphore::new(1);
+    let queue_semaphore = tokio::sync::Semaphore::new(1);
+    let active = run_semaphore.acquire().await.unwrap();
+    let session_key = format!("queue-wait-{}", uuid::Uuid::new_v4());
+    let pending = acquire_external_cli_run_permit(
+        &run_semaphore,
+        &queue_semaphore,
+        1,
+        Some(session_key.clone()),
+        None,
+    );
+    tokio::pin!(pending);
+
+    assert!(timeout(Duration::from_millis(50), &mut pending)
+        .await
+        .is_err());
+    assert!(QUEUED_WORKER_SESSIONS.contains_key(&session_key));
+
+    drop(active);
+    let permit = timeout(Duration::from_secs(1), &mut pending)
+        .await
+        .expect("queued run should start after a slot is released")
+        .unwrap();
+    assert!(!QUEUED_WORKER_SESSIONS.contains_key(&session_key));
+    drop(permit);
+}
+
+#[tokio::test]
+async fn external_cli_queue_remains_cancellable_without_a_deadline() {
+    let _registry_guard = external_cli_env_guard_async().await;
+    let run_semaphore = tokio::sync::Semaphore::new(1);
+    let queue_semaphore = tokio::sync::Semaphore::new(1);
+    let _active = run_semaphore.acquire().await.unwrap();
+    let session_key = format!("queue-cancel-{}", uuid::Uuid::new_v4());
+    let pending = acquire_external_cli_run_permit(
+        &run_semaphore,
+        &queue_semaphore,
+        1,
+        Some(session_key.clone()),
+        None,
+    );
+    tokio::pin!(pending);
+
+    assert!(timeout(Duration::from_millis(50), &mut pending)
+        .await
+        .is_err());
+    assert!(request_worker_session_stop(&session_key).await);
+    let error = timeout(Duration::from_secs(1), &mut pending)
+        .await
+        .expect("queued cancellation should be observed")
+        .unwrap_err();
+    assert_eq!(error, "external CLI run cancelled while queued");
+    assert!(!QUEUED_WORKER_SESSIONS.contains_key(&session_key));
+}
+
+#[tokio::test]
+async fn external_cli_queue_cancellation_wins_when_a_run_slot_is_also_ready() {
+    let _registry_guard = external_cli_env_guard_async().await;
+    let run_semaphore = tokio::sync::Semaphore::new(1);
+    let queue_semaphore = tokio::sync::Semaphore::new(1);
+    let active = run_semaphore.acquire().await.unwrap();
+    let session_key = format!("queue-cancel-race-{}", uuid::Uuid::new_v4());
+    let pending = acquire_external_cli_run_permit(
+        &run_semaphore,
+        &queue_semaphore,
+        1,
+        Some(session_key.clone()),
+        None,
+    );
+    tokio::pin!(pending);
+
+    assert!(timeout(Duration::from_millis(50), &mut pending)
+        .await
+        .is_err());
+    assert!(request_worker_session_stop(&session_key).await);
+    drop(active);
+
+    let error = timeout(Duration::from_secs(1), &mut pending)
+        .await
+        .expect("queued cancellation should win over a simultaneously ready run slot")
+        .unwrap_err();
+    assert_eq!(error, "external CLI run cancelled while queued");
+    assert!(!QUEUED_WORKER_SESSIONS.contains_key(&session_key));
+}
+
+#[tokio::test]
+async fn external_cli_queue_rejects_work_beyond_its_capacity() {
+    let _registry_guard = external_cli_env_guard_async().await;
+    let run_semaphore = tokio::sync::Semaphore::new(1);
+    let queue_semaphore = tokio::sync::Semaphore::new(1);
+    let _active = run_semaphore.acquire().await.unwrap();
+    let queued_session = format!("queue-full-first-{}", uuid::Uuid::new_v4());
+    let pending = acquire_external_cli_run_permit(
+        &run_semaphore,
+        &queue_semaphore,
+        1,
+        Some(queued_session.clone()),
+        None,
+    );
+    tokio::pin!(pending);
+    assert!(timeout(Duration::from_millis(50), &mut pending)
+        .await
+        .is_err());
+
+    let error = acquire_external_cli_run_permit(
+        &run_semaphore,
+        &queue_semaphore,
+        1,
+        Some(format!("queue-full-second-{}", uuid::Uuid::new_v4())),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error, "external CLI queue is full (capacity 1)");
+
+    assert!(request_worker_session_stop(&queued_session).await);
+    assert!(pending
+        .await
+        .unwrap_err()
+        .contains("cancelled while queued"));
+}
+
+#[tokio::test]
+async fn external_cli_queue_honors_an_explicit_deadline() {
+    let _registry_guard = external_cli_env_guard_async().await;
+    let run_semaphore = tokio::sync::Semaphore::new(1);
+    let queue_semaphore = tokio::sync::Semaphore::new(1);
+    let _active = run_semaphore.acquire().await.unwrap();
+
+    let error = acquire_external_cli_run_permit(
+        &run_semaphore,
+        &queue_semaphore,
+        1,
+        Some(format!("queue-timeout-{}", uuid::Uuid::new_v4())),
+        Some(1),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error, "external CLI queue timed out after 1 seconds");
+}
+
+#[tokio::test]
+async fn external_cli_queue_settings_use_bounded_defaults_and_an_opt_in_deadline() {
+    let _registry_guard = external_cli_env_guard_async().await;
+    let _concurrency = EnvGuard::unset("BIFROST_EXTERNAL_CLI_MAX_CONCURRENCY");
+    let _capacity = EnvGuard::unset("BIFROST_EXTERNAL_CLI_QUEUE_CAPACITY");
+    let _timeout = EnvGuard::unset("BIFROST_EXTERNAL_CLI_QUEUE_TIMEOUT_SECS");
+
+    assert_eq!(external_cli_max_concurrency(), 4);
+    assert_eq!(external_cli_queue_capacity(), 16);
+    assert_eq!(external_cli_queue_timeout_secs(), None);
+
+    let _concurrency = EnvGuard::set_str("BIFROST_EXTERNAL_CLI_MAX_CONCURRENCY", "99");
+    let _capacity = EnvGuard::set_str("BIFROST_EXTERNAL_CLI_QUEUE_CAPACITY", "99");
+    let _timeout = EnvGuard::set_str("BIFROST_EXTERNAL_CLI_QUEUE_TIMEOUT_SECS", "999");
+
+    assert_eq!(external_cli_max_concurrency(), 16);
+    assert_eq!(external_cli_queue_capacity(), 64);
+    assert_eq!(external_cli_queue_timeout_secs(), Some(600));
+}
+
+#[tokio::test]
 async fn registered_worker_stop_resolves_named_and_sessionless_runs() {
     let _registry_guard = external_cli_env_guard_async().await;
     let temp_dir = tempfile::tempdir().unwrap();
